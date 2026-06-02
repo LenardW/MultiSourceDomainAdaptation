@@ -18,7 +18,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import argparse
 import os
-
+from scipy.stats import pearsonr
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature names (for reference and documentation)
@@ -239,8 +239,8 @@ def evaluate(G, F1, F2, loader, device, normalizer):
         preds.append(pred.cpu())
         targets.append(Y_b.cpu())
 
-    preds   = torch.cat(preds).numpy()
-    targets = torch.cat(targets).numpy()
+    preds   = torch.cat(preds).numpy().flatten()
+    targets = torch.cat(targets).numpy().flatten()
 
     # Denormalise for interpretable metrics
     preds_orig   = normalizer.inverse_Y(preds)
@@ -252,6 +252,9 @@ def evaluate(G, F1, F2, loader, device, normalizer):
     ss_res = np.sum((targets_orig - preds_orig) ** 2)
     ss_tot = np.sum((targets_orig - targets_orig.mean()) ** 2)
     r2 = 1 - ss_res / (ss_tot + 1e-8)
+
+    correlation, _ = pearsonr(targets, preds)
+    print(f" Correlation (r): {correlation:.4f}")
 
     return mae, rmse, r2
 
@@ -381,6 +384,10 @@ def train(args):
             opt_g.zero_grad();
             opt_f.zero_grad()
             total.backward()
+
+            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(list(F1.parameters()) + list(F2.parameters()), max_norm=1.0)
+
             opt_g.step();
             opt_f.step()
 
@@ -426,13 +433,13 @@ def parse_args():
     p.add_argument("--y_path",        type=str,   default="C:/Users/leona/PythonScripts/MasterThesis/Tierdaten/Y_anim1.csv")
     p.add_argument("--save_path",     type=str,   default="output_drt")
     p.add_argument("--epochs",        type=int,   default=100)
-    p.add_argument("--warmup_epochs", type=int,   default=20,
+    p.add_argument("--warmup_epochs", type=int,   default=70,
                    help="Epochs of source-only training before DA losses activate")
     p.add_argument("--batch_size",    type=int,   default=64)
-    p.add_argument("--lr",            type=float, default=0.01,  help="backbone lr")
-    p.add_argument("--lr_f",          type=float, default=0.01,  help="head lr")
+    p.add_argument("--lr",            type=float, default=0.001,  help="backbone lr")
+    p.add_argument("--lr_f",          type=float, default=0.003,  help="head lr")
     p.add_argument("--lmbd",          type=float, default=0.25,  help="grad reversal λ")
-    p.add_argument("--eta",           type=float, default=1.0,   help="discrepancy weight")
+    p.add_argument("--eta",           type=float, default=0.2,   help="discrepancy weight")
     p.add_argument("--gamma",         type=float, default=0.01,  help="variance penalty weight")
     p.add_argument("--hidden_dim",    type=int,   default=128)
     p.add_argument("--schedule",      type=int,   nargs="+", default=[40, 70, 90])
