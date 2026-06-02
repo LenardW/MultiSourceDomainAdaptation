@@ -137,7 +137,6 @@ class Normalizer:
     def inverse_Y(self, Y_norm):
         return Y_norm * self.Y_std + self.Y_mean
 
-
 def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
     X_t = torch.tensor(X, dtype=torch.float32)
     Y_t = torch.tensor(Y, dtype=torch.float32)
@@ -256,77 +255,84 @@ def evaluate(G, F1, F2, loader, device, normalizer):
 
     return mae, rmse, r2
 
+
 def train(args):
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
     )
     print(f"\nDevice: {device}")
 
-    # ── Load real data ────────────────────────────────────────────────────────
-    X_real, Y_real = load_data(args.x_path, args.y_path)
+    # ── 1. Load the Target Animal Domain ─────────────────────────────────────
+    # The target animal is defined by your --x_path and --y_path arguments
+    target_X, target_Y = load_data(args.x_path, args.y_path)
 
-    # ── Simulate additional source domains ───────────────────────────────────
-    #scales = [0.5, 0.8, 2.35, 4.67, 0.24, 1.89]
-    print("\nSimulating domain variants:")
-    all_domains = make_all_domains(X_real, Y_real)
+    # ── 2. Dynamically Load Selected Real Source Animals ──────────────────────
+    # Looks in the same directory as the target data for your specific source files
+    base_dir = os.path.dirname(args.x_path)
+    source_ids = [3, 4, 8, 10]
 
-    # ── Define source domains (all simulated) and target (real) ──────────────
-    # In practice you would use real data from multiple animals as sources.
-    # Here: simulated domains = sources, real data = target.
-    source_domains = all_domains[1:]   # 6 simulated domains
-    target_X, target_Y = all_domains[0]
+    source_domains = []
+    print("\nLoading real multi-source domains:")
+    for s_id in source_ids:
+        x_src_path = os.path.join(base_dir, f"X_anim{s_id}.csv")
+        y_src_path = os.path.join(base_dir, f"Y_anim{s_id}.csv")
 
-    # ── Normalise: fit on first source, apply everywhere ─────────────────────
-    normalizer = Normalizer().fit(source_domains[0][0], source_domains[0][1])
+        # Guard rails to make sure the loop handles missing files gracefully
+        if os.path.exists(x_src_path) and os.path.exists(y_src_path):
+            print(f"  -> Loading Source Animal {s_id}...")
+            X_s, Y_s = load_data(x_src_path, y_src_path)
+            source_domains.append((X_s, Y_s))
 
-    def norm(X, Y):
-        return normalizer.transform_X(X), normalizer.transform_Y(Y)
+    # Is concatenate really the correct thing to do?
+    X_src_all = np.concatenate([X for X, Y in source_domains], axis=0)
+    Y_src_all = np.concatenate([Y for X, Y in source_domains], axis=0)
 
-    source_domains = [norm(X, Y) for X, Y in source_domains]
-    target_X_n, target_Y_n = norm(target_X, target_Y)
+    # ── 4. Normalise: Fit ONLY on the pooled real sources, apply everywhere ──
+    normalizer = Normalizer().fit(X_src_all, Y_src_all)
 
-    # ── Split target into train (unlabelled for DA) and val (for evaluation) ─
+    X_src_n = normalizer.transform_X(X_src_all)
+    Y_src_n = normalizer.transform_Y(Y_src_all)
+
+    target_X_n = normalizer.transform_X(target_X)
+    target_Y_n = normalizer.transform_Y(target_Y)
+
+    # ── 5. Split Target Domain into Train (unlabelled) and Val (evaluation) ──
     (trg_train_X, trg_train_Y), (trg_val_X, trg_val_Y) = split_domain(
         target_X_n, target_Y_n, val_ratio=0.2
     )
+    # ── 6. Create Balanced DataLoaders ────────────────────────────────────────
 
-    # ── Combine all source domains into one loader ────────────────────────────
-    X_src = np.concatenate([X for X, Y in source_domains], axis=0)
-    Y_src = np.concatenate([Y for X, Y in source_domains], axis=0)
-    src_loader = make_loader(X_src, Y_src, args.batch_size)
+    src_loader = make_loader(X_src_n, Y_src_n, args.batch_size)
     trg_loader = make_loader(trg_train_X, trg_train_Y, args.batch_size)
     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
                              shuffle=False, drop_last=False)
 
-    print(f"\nSource samples: {len(X_src)}")
-    print(f"Target train:   {len(trg_train_X)}")
-    print(f"Target val:     {len(trg_val_X)}")
+    print(f"\nTotal Merged Source Samples: {len(X_src_n)}")
+    print(f"Target Training Samples:     {len(trg_train_X)}")
+    print(f"Target Validation Samples:   {len(trg_val_X)}")
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    G  = StrokeworkBackbone(in_dim=N_FEATURES, hidden_dim=args.hidden_dim).to(device)
+    # ── 7. Models and Optimizers ──────────────────────────────────────────────
+    G = StrokeworkBackbone(in_dim=N_FEATURES, hidden_dim=args.hidden_dim).to(device)
     F1 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
     F2 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
 
-    opt_g = optim.SGD(G.parameters(),
-                      lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),
-                      lr=args.lr_f, momentum=0.9, weight_decay=5e-4)
+    opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()), lr=args.lr_f, momentum=0.9, weight_decay=5e-4)
 
-    scheduler_g = optim.lr_scheduler.MultiStepLR(
-        opt_g, milestones=args.schedule, gamma=0.1)
-    scheduler_f = optim.lr_scheduler.MultiStepLR(
-        opt_f, milestones=args.schedule, gamma=0.1)
+    scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
+    scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
 
     best_mae = float('inf')
     os.makedirs(args.save_path, exist_ok=True)
 
-    print(f"\nStarting training for {args.epochs} epochs "
-          f"(warmup: {args.warmup_epochs} epochs)\n")
+    print(f"\nStarting Real MSDA training for {args.epochs} epochs (warmup: {args.warmup_epochs} epochs)\n")
 
+    # ── 8. Training Loop ──────────────────────────────────────────────────────
     for epoch in range(1, args.epochs + 1):
-        G.train(); F1.train(); F2.train()
+        G.train();
+        F1.train();
+        F2.train()
 
-        # Gate DA losses during warmup
         da_active = epoch > args.warmup_epochs
         da_weight = 1.0 if da_active else 0.0
 
@@ -344,66 +350,45 @@ def train(args):
             X_t = X_t.to(device)
             bsz = X_s.size(0)
 
-            # ── Forward ───────────────────────────────────────────────────
+            # ── Forward Passes ──
             data = torch.cat([X_s, X_t], dim=0)
             feat = G(data)
-
             feat_s, feat_t = feat[:bsz], feat[bsz:]
 
-            # pred_s1 = F1(feat_s)
-            # pred_s2 = F2(feat_s)
-            #
-            # # ── Supervised losses on source ───────────────────────────────
-            # loss1 = F.mse_loss(pred_s1, Y_s)
-            # loss2 = F.mse_loss(pred_s2, Y_s)
-            #
-            # # ── DA losses on target (only after warmup) ───────────────────
-            # pred_t1_rev = F1(feat_t, reverse=True)
-            # pred_t2_rev = F2(feat_t, reverse=True)
-            #
-            # dis  = discrepancy_loss(pred_t1_rev, pred_t2_rev)
-            # vpen = variance_penalty(pred_t1_rev, pred_t2_rev)
-            #
-            # total = (loss1 + loss2
-            #          + da_weight * args.gamma * vpen
-            #          - da_weight * args.eta   * dis)
-
-            # 1. Standard forward pass for source and target (No GRL)
+            # Standard forward pass (No GRL) for source MSE and target variance
             pred_s1 = F1(feat_s, reverse=False)
             pred_s2 = F2(feat_s, reverse=False)
             pred_t1 = F1(feat_t, reverse=False)
             pred_t2 = F2(feat_t, reverse=False)
 
-            # 2. Supervised losses on source
+            # Supervised loss calculation on true source data
             loss1 = F.mse_loss(pred_s1, Y_s)
             loss2 = F.mse_loss(pred_s2, Y_s)
 
-            # 3. Cooperative variance penalty on target (Both G and F want to maximize variance)
+            # Safe Variance Penalty (Cooperative calculation, kept separate from GRL)
             vpen = variance_penalty(pred_t1, pred_t2)
 
-            # 4. Adversarial forward pass ONLY for the discrepancy loss
+            # Adversarial Discrepancy (Uses GRL)
             pred_t1_rev = F1(feat_t, reverse=True)
             pred_t2_rev = F2(feat_t, reverse=True)
             dis = discrepancy_loss(pred_t1_rev, pred_t2_rev)
 
-            # 5. Combined loss
+            # Unified Loss Objective
             total = (loss1 + loss2
                      + da_weight * args.gamma * vpen
                      - da_weight * args.eta * dis)
 
-            ####
-
-
-            opt_g.zero_grad(); opt_f.zero_grad()
+            opt_g.zero_grad();
+            opt_f.zero_grad()
             total.backward()
-            opt_g.step(); opt_f.step()
+            opt_g.step();
+            opt_f.step()
 
-            n = bsz
-            stats["mse1"] += loss1.item() * n
-            stats["mse2"] += loss2.item() * n
-            stats["dis"]  += dis.item()   * n
-            stats["var"]  += vpen.item()  * n
-            stats["n"]    += n
+            stats["mse1"] += loss1.item() * bsz
+            stats["mse2"] += loss2.item() * bsz
+            stats["dis"] += dis.item() * bsz
+            stats["var"] += vpen.item() * bsz
+            stats["n"] += bsz
 
         scheduler_g.step()
         scheduler_f.step()
@@ -411,8 +396,8 @@ def train(args):
         n = stats["n"]
         da_str = "ON " if da_active else "OFF"
         print(f"Epoch {epoch:03d}/{args.epochs}  DA:{da_str}  "
-              f"MSE1={stats['mse1']/n:.4f}  MSE2={stats['mse2']/n:.4f}  "
-              f"Dis={stats['dis']/n:.4f}  Var={stats['var']/n:.4f}")
+              f"MSE1={stats['mse1'] / n:.4f}  MSE2={stats['mse2'] / n:.4f}  "
+              f"Dis={stats['dis'] / n:.4f}  Var={stats['var'] / n:.4f}")
 
         mae, rmse, r2 = evaluate(G, F1, F2, val_loader, device, normalizer)
         print(f"             Val → MAE={mae:.4f}  RMSE={rmse:.4f}  R²={r2:.4f}")
@@ -420,7 +405,7 @@ def train(args):
         if mae < best_mae:
             best_mae = mae
             torch.save({
-                "G":  G.state_dict(),
+                "G": G.state_dict(),
                 "F1": F1.state_dict(),
                 "F2": F2.state_dict(),
                 "normalizer": normalizer,
