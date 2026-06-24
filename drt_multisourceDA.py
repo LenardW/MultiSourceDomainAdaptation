@@ -109,26 +109,89 @@ def grad_reverse(x, lmbd=1.0):
 #     def forward(self, x):
 #         return self.net(x)
 
-class DynamicBackbone(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=128):
+# class DynamicBackbone(nn.Module):
+#     def __init__(self, in_dim=14, hidden_dim=128):
+#         super().__init__()
+#         self.encoder = nn.Sequential(
+#             nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.ReLU()
+#         )
+#         # attention network  generates per-sample feature weights
+#         self.attention = nn.Sequential(
+#             nn.Linear(256, 64), nn.ReLU(),
+#             nn.Linear(64, 256), nn.Sigmoid()   # weights in [0,1]
+#         )
+#         self.out = nn.Sequential(
+#             nn.Linear(256, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU()
+#         )
+#
+#     def forward(self, x):
+#         h = self.encoder(x)
+#         alpha = self.attention(h)   # input-conditioned weights
+#         h = h * alpha               # channel attention
+#         return self.out(h)
+
+class DynamicLinear(nn.Module):
+    def __init__(self, in_dim, out_dim, K=4):
         super().__init__()
+        self.K = K
+        self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim))
+        self.static_bias = nn.Parameter(torch.Tensor(out_dim))
+        self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim))
+
+        nn.init.kaiming_uniform_(self.static_weight, a=np.sqrt(5))
+        nn.init.zeros_(self.static_bias)
+        nn.init.zeros_(self.residual_weights)
+
+    def forward(self, x, routing_weights):
+        # Dynamically compute weights per sample
+        res_w = torch.einsum('bk,kij->bij', routing_weights, self.residual_weights)
+        weight = self.static_weight.unsqueeze(0) + res_w  # [B, out_dim, in_dim]
+
+        # Batch linear projection
+        out = torch.bmm(x.unsqueeze(1), weight.transpose(1, 2)).squeeze(1)
+        out = out + self.static_bias
+        return out
+
+
+class DynamicBackbone(nn.Module):
+    def __init__(self, in_dim=14, hidden_dim=128, K=4):
+        super().__init__()
+        self.K = K
+
+        # 1. Base feature extractor
         self.encoder = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.ReLU()
-        )
-        # attention network  generates per-sample feature weights
-        self.attention = nn.Sequential(
-            nn.Linear(256, 64), nn.ReLU(),
-            nn.Linear(64, 256), nn.Sigmoid()   # weights in [0,1]
-        )
-        self.out = nn.Sequential(
-            nn.Linear(256, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU()
+            nn.Linear(in_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU()
         )
 
+        # 2. Routing network: Predicts the π coefficients for the dynamic weights.
+        # The DRT paper uses a Softmax over K components so they sum to 1.
+        self.routing_net = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, K),
+            nn.Softmax(dim=-1)
+        )
+
+        # 3. Dynamic alternative to standard nn.Linear
+        self.dynamic_layer = DynamicLinear(256, hidden_dim, K=K)
+
+        # 4. Final output processing
+        self.bn_out = nn.BatchNorm1d(hidden_dim)
+        self.relu_out = nn.ReLU()
+
     def forward(self, x):
+        # Extract base features
         h = self.encoder(x)
-        alpha = self.attention(h)   # input-conditioned weights
-        h = h * alpha               # channel attention
-        return self.out(h)
+
+        # Generate sample-conditioned routing weights π(x)
+        routing_weights = self.routing_net(h)  # Shape: [batch_size, K]
+
+        # Pass features AND routing weights into the Dynamic Layer
+        h_dyn = self.dynamic_layer(h, routing_weights)
+
+        return self.relu_out(self.bn_out(h_dyn))
 
 class SubspaceRouter(nn.Module):
     """Split hidden features into two subspaces for F1 and F2."""
@@ -164,8 +227,8 @@ def discrepancy_loss(pred1, pred2):
     Replaces |softmax(F1) - softmax(F2)| from classification DRT.
     For regression: mean absolute difference between the two heads.
     """
-    return torch.mean(torch.abs(pred1 - pred2))
-
+    # Restricts the loss cleanly between 0 and 1
+    return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
 
 def variance_penalty(pred1, pred2):
     """
@@ -278,8 +341,8 @@ def train(args):
     F2 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
     router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
 
-    opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()) + list(router.parameters()), lr=args.lr_f, momentum=0.9, weight_decay=5e-4)
+    opt_g = optim.AdamW(G.parameters(), lr=args.lr, weight_decay=5e-4)
+    opt_f = optim.AdamW(list(F1.parameters()) + list(F2.parameters()) + list(router.parameters()), lr=args.lr_f, weight_decay=5e-4)
 
     scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
     scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
@@ -303,7 +366,7 @@ def train(args):
             if epoch <= args.warmup_epochs:
                 da_weight = 0.0
             else:
-                da_weight = min(1.0, (epoch - args.warmup_epochs) / 40.0)
+                da_weight = min(1.0, (epoch - args.warmup_epochs) / 20.0)
 
             trg_iter = iter(trg_loader)
             stats = {"mse1": 0., "mse2": 0., "dis": 0., "var": 0., "n": 0}
@@ -319,48 +382,126 @@ def train(args):
                 X_t = X_t.to(device)
                 bsz = X_s.size(0)
 
-                # ── Forward Passes ──
-                data = torch.cat([X_s, X_t], dim=0)
-                feat = G(data)
-                feat_s, feat_t = feat[:bsz], feat[bsz:]
+                # # ── Forward Passes ──
+                # data = torch.cat([X_s, X_t], dim=0)
+                # feat = G(data)
+                # feat_s, feat_t = feat[:bsz], feat[bsz:]
+                #
+                # # sub1, sub2 = router(feat_t)
+                # #
+                # # # Standard forward pass (No GRL) for source MSE and target variance
+                # # pred_s1 = F1(feat_s, reverse=False)
+                # # pred_s2 = F2(feat_s, reverse=False)
+                # # pred_t1 = F1(sub1, reverse=False)
+                # # pred_t2 = F2(sub2, reverse=False)
+                #
+                # # Pass both domains through the router
+                # sub1_s, sub2_s = router(feat_s)
+                # sub1_t, sub2_t = router(feat_t)
+                #
+                # # Make predictions on identical feature spaces
+                # pred_s1 = F1(sub1_s)
+                # pred_s2 = F2(sub2_s)
+                # pred_t1 = F1(sub1_t)
+                # pred_t2 = F2(sub2_t)
+                #
+                # # Supervised loss calculation on true source data
+                # loss1 = F.mse_loss(pred_s1, Y_s)
+                # loss2 = F.mse_loss(pred_s2, Y_s)
+                #
+                # # Safe Variance Penalty (Cooperative calculation, kept separate from GRL)
+                # vpen = variance_penalty(pred_t1, pred_t2)
+                #
+                # # Adversarial Discrepancy (Uses GRL)
+                # pred_t1_rev = F1(sub1, reverse=True)
+                # pred_t2_rev = F2(sub2, reverse=True)
+                # dis = discrepancy_loss(pred_t1_rev, pred_t2_rev)
+                #
+                # # Unified Loss Objective
+                # total = (loss1 + loss2
+                #          + da_weight * args.gamma * vpen
+                #          - da_weight * args.eta * dis)
+                #
+                # opt_g.zero_grad()
+                # opt_f.zero_grad()
+                # total.backward()
+                #
+                # torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
+                # torch.nn.utils.clip_grad_norm_(list(F1.parameters()) + list(F2.parameters()) + list(router.parameters()), max_norm=1.0)
+                #
+                # opt_g.step()
+                # opt_f.step()
 
-                sub1, sub2 = router(feat_t)
+                # =============================================================
+                # STEP A: Train Everything on Source Data (Minimize Regression Error)
+                # =============================================================
+                feat_s = G(X_s)
+                sub1_s, sub2_s = router(feat_s)
+                pred_s1 = F1(sub1_s)
+                pred_s2 = F2(sub2_s)
 
-                # Standard forward pass (No GRL) for source MSE and target variance
-                pred_s1 = F1(feat_s, reverse=False)
-                pred_s2 = F2(feat_s, reverse=False)
-                pred_t1 = F1(sub1, reverse=False)
-                pred_t2 = F2(sub2, reverse=False)
-
-                # Supervised loss calculation on true source data
-                loss1 = F.mse_loss(pred_s1, Y_s)
-                loss2 = F.mse_loss(pred_s2, Y_s)
-
-                # Safe Variance Penalty (Cooperative calculation, kept separate from GRL)
-                vpen = variance_penalty(pred_t1, pred_t2)
-
-                # Adversarial Discrepancy (Uses GRL)
-                pred_t1_rev = F1(sub1, reverse=True)
-                pred_t2_rev = F2(sub2, reverse=True)
-                dis = discrepancy_loss(pred_t1_rev, pred_t2_rev)
-
-                # Unified Loss Objective
-                total = (loss1 + loss2
-                         + da_weight * args.gamma * vpen
-                         - da_weight * args.eta * dis)
+                loss_s1 = F.mse_loss(pred_s1, Y_s)
+                loss_s2 = F.mse_loss(pred_s2, Y_s)
+                loss_stepA = loss_s1 + loss_s2
 
                 opt_g.zero_grad()
                 opt_f.zero_grad()
-                total.backward()
-
-                torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(list(F1.parameters()) + list(F2.parameters()) + list(router.parameters()), max_norm=1.0)
-
+                loss_stepA.backward()
                 opt_g.step()
                 opt_f.step()
 
-                stats["mse1"] += loss1.item() * bsz
-                stats["mse2"] += loss2.item() * bsz
+                # =============================================================
+                # STEP B: Train Router & Heads (Maximize Target Discrepancy)
+                # =============================================================
+                # We detach G here because we want to freeze the backbone
+                feat_s = G(X_s).detach()
+                feat_t = G(X_t).detach()
+
+                sub1_s, sub2_s = router(feat_s)
+                sub1_t, sub2_t = router(feat_t)
+
+                pred_s1 = F1(sub1_s)
+                pred_s2 = F2(sub2_s)
+                pred_t1 = F1(sub1_t)
+                pred_t2 = F2(sub2_t)
+
+                loss_s1 = F.mse_loss(pred_s1, Y_s)
+                loss_s2 = F.mse_loss(pred_s2, Y_s)
+                dis = discrepancy_loss(pred_t1, pred_t2)
+                vpen = variance_penalty(pred_t1, pred_t2)
+
+                # Notice the MINUS sign before 'dis'. Minimizing a negative
+                # loss maximizes the discrepancy, forcing the heads to find different boundaries.
+                loss_stepB = (loss_s1 + loss_s2) + da_weight * (args.gamma * vpen - args.eta * dis)
+
+                opt_g.zero_grad()
+                opt_f.zero_grad()
+                loss_stepB.backward()
+                opt_f.step()  # ONLY optimize Router, F1, and F2
+
+                # =============================================================
+                # STEP C: Train Backbone G (Minimize Target Discrepancy)
+                # =============================================================
+                # We do NOT detach G here. We freeze the router and heads.
+                feat_t = G(X_t)
+                sub1_t, sub2_t = router(feat_t)
+                pred_t1 = F1(sub1_t)
+                pred_t2 = F2(sub2_t)
+
+                dis = discrepancy_loss(pred_t1, pred_t2)
+                vpen = variance_penalty(pred_t1, pred_t2)
+
+                # Notice the PLUS sign before 'dis'. G wants to minimize
+                # discrepancy, pushing target features into areas where F1 and F2 agree.
+                loss_step3 = da_weight * (args.eta * dis + args.gamma * vpen)
+
+                opt_g.zero_grad()
+                opt_f.zero_grad()
+                loss_step3.backward()
+                opt_g.step()  # ONLY optimize Backbone G
+
+                stats["mse1"] += loss_s1.item() * bsz
+                stats["mse2"] += loss_s2.item() * bsz
                 stats["dis"] += dis.item() * bsz
                 stats["var"] += vpen.item() * bsz
                 stats["n"] += bsz
@@ -410,11 +551,11 @@ def parse_args():
     p.add_argument("--source_x_dicts", type=str, default="X_anim3.csv,X_anim4.csv,X_anim8.csv,X_anim10.csv")
     p.add_argument("--source_y_dicts", type=str, default="Y_anim3.csv,Y_anim4.csv,Y_anim8.csv,Y_anim10.csv")
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=100,
+    p.add_argument("--warmup_epochs", type=int, default=50,
                    help="Epochs of source-only training before DA losses activate")
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
-    p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
+    p.add_argument("--lr", type=float, default=0.0005, help="backbone lr")
+    p.add_argument("--lr_f", type=float, default=0.001, help="head lr")
     p.add_argument("--lmbd", type=float, default=0.25, help="grad reversal λ")
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
