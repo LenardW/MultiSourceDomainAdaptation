@@ -20,9 +20,6 @@ import argparse
 import os
 from scipy.stats import pearsonr
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Feature names (for reference and documentation)
-# ─────────────────────────────────────────────────────────────────────────────
 
 FEATURE_NAMES = [
     'p_head_by_lvad_flow',
@@ -43,10 +40,6 @@ FEATURE_NAMES = [
 
 N_FEATURES = len(FEATURE_NAMES)   # 14
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Data loading
-# ─────────────────────────────────────────────────────────────────────────────
 
 def load_csv(path, n_cols):
     """
@@ -265,24 +258,19 @@ def train(args):
     )
     print(f"\nDevice: {device}")
 
-    # ── 1. Load the Target Animal Domain ─────────────────────────────────────
-    # The target animal is defined by your --x_path and --y_path arguments
+    #load target domain and labels
     target_X, target_Y = load_data(args.x_path, args.y_path)
 
-    # ── 2. Dynamically Load Selected Real Source Animals ──────────────────────
-    # Looks in the same directory as the target data for your specific source files
+    #load target domains from same directory
     base_dir = os.path.dirname(args.x_path)
     source_ids = [3, 4, 8, 10]
 
     source_domains = []
-    print("\nLoading real multi-source domains:")
     for s_id in source_ids:
         x_src_path = os.path.join(base_dir, f"X_anim{s_id}.csv")
         y_src_path = os.path.join(base_dir, f"Y_anim{s_id}.csv")
 
-        # Guard rails to make sure the loop handles missing files gracefully
         if os.path.exists(x_src_path) and os.path.exists(y_src_path):
-            print(f"  -> Loading Source Animal {s_id}...")
             X_s, Y_s = load_data(x_src_path, y_src_path)
             source_domains.append((X_s, Y_s))
 
@@ -330,7 +318,6 @@ def train(args):
 
     print(f"\nStarting Real MSDA training for {args.epochs} epochs (warmup: {args.warmup_epochs} epochs)\n")
 
-    # ── 8. Training Loop ──────────────────────────────────────────────────────
     for epoch in range(1, args.epochs + 1):
         G.train();
         F1.train();
@@ -423,12 +410,8 @@ def train(args):
     print(f"Done.  Best MAE on target val: {best_mae:.4f}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10.  Args
-# ─────────────────────────────────────────────────────────────────────────────
-
 def parse_args():
-    p = argparse.ArgumentParser(description="DRT for strokework regression")
+    p = argparse.ArgumentParser(description="DRT")
     p.add_argument("--x_path",        type=str,   default="C:/Users/leona/PythonScripts/MasterThesis/Tierdaten/X_anim1.csv")
     p.add_argument("--y_path",        type=str,   default="C:/Users/leona/PythonScripts/MasterThesis/Tierdaten/Y_anim1.csv")
     p.add_argument("--save_path",     type=str,   default="output_drt")
@@ -439,8 +422,8 @@ def parse_args():
     p.add_argument("--lr",            type=float, default=0.001,  help="backbone lr")
     p.add_argument("--lr_f",          type=float, default=0.003,  help="head lr")
     p.add_argument("--lmbd",          type=float, default=0.25,  help="grad reversal λ")
-    p.add_argument("--eta",           type=float, default=0.2,   help="discrepancy weight")
-    p.add_argument("--gamma",         type=float, default=0.01,  help="variance penalty weight")
+    p.add_argument("--eta",           type=float, default=0.4,   help="discrepancy weight")
+    p.add_argument("--gamma",         type=float, default=0.001 ,  help="variance penalty weight")
     p.add_argument("--hidden_dim",    type=int,   default=128)
     p.add_argument("--schedule",      type=int,   nargs="+", default=[40, 70, 90])
     p.add_argument("--no_cuda",       action="store_true")
