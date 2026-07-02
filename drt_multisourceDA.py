@@ -241,9 +241,9 @@ def variance_penalty(pred1, pred2):
 
 
 @torch.no_grad()
-def evaluate(G, router, F1, F2, loader, device, normalizer):
+def evaluate(G, Router, F1, F2, loader, device, normalizer):
     G.eval()
-    router.eval()
+    Router.eval()
     F1.eval()
     F2.eval()
 
@@ -252,7 +252,7 @@ def evaluate(G, router, F1, F2, loader, device, normalizer):
     for X_b, Y_b in loader:
         X_b, Y_b = X_b.to(device), Y_b.to(device)
         feat = G(X_b)
-        sub1, sub2 = router(feat)
+        sub1, sub2 = Router(feat)
         # ensemble: average of the two heads
         pred = (F1(sub1) + F2(sub2)) / 2.0
         preds.append(pred.cpu())
@@ -289,7 +289,6 @@ def train(args):
     target_x_path = os.path.join(args.data_dict_path, args.target_x_dict)
     target_y_path = os.path.join(args.data_dict_path, args.target_y_dict)
     target_X, target_Y = load_data(target_x_path, target_y_path)
-
 
     # load source domains
     source_domains = []
@@ -339,17 +338,17 @@ def train(args):
     G = DynamicBackbone(in_dim=args.input_dim, hidden_dim=args.hidden_dim).to(device)
     F1 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
     F2 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
-    router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
+    Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
 
-    opt_g = optim.AdamW(G.parameters(), lr=args.lr, weight_decay=5e-4)
-    opt_f = optim.AdamW(list(F1.parameters()) + list(F2.parameters()) + list(router.parameters()), lr=args.lr_f, weight_decay=5e-4)
+    opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()) + list(Router.parameters()), lr=args.lr_f, momentum=0.9, weight_decay=5e-4)
 
     scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
     scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
 
     best_mae = float('inf')
 
-    print(f"\nStarting Real MSDA training for {args.epochs} epochs (warmup: {args.warmup_epochs} epochs)\n")
+    print(f"\nMSDA training for {args.epochs} epochs (warmup: {args.warmup_epochs} epochs)\n")
 
     with mlflow.start_run() as run:
         # Log training parameters
@@ -358,7 +357,7 @@ def train(args):
             G.train()
             F1.train()
             F2.train()
-            router.train()
+            Router.train()
 
             # da_active = epoch > args.warmup_epochs
             # da_weight = 1.0 if da_active else 0.0
@@ -387,7 +386,7 @@ def train(args):
                 # feat = G(data)
                 # feat_s, feat_t = feat[:bsz], feat[bsz:]
                 #
-                # # sub1, sub2 = router(feat_t)
+                # # sub1, sub2 = Router(feat_t)
                 # #
                 # # # Standard forward pass (No GRL) for source MSE and target variance
                 # # pred_s1 = F1(feat_s, reverse=False)
@@ -396,8 +395,8 @@ def train(args):
                 # # pred_t2 = F2(sub2, reverse=False)
                 #
                 # # Pass both domains through the router
-                # sub1_s, sub2_s = router(feat_s)
-                # sub1_t, sub2_t = router(feat_t)
+                # sub1_s, sub2_s = Router(feat_s)
+                # sub1_t, sub2_t = Router(feat_t)
                 #
                 # # Make predictions on identical feature spaces
                 # pred_s1 = F1(sub1_s)
@@ -427,7 +426,7 @@ def train(args):
                 # total.backward()
                 #
                 # torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
-                # torch.nn.utils.clip_grad_norm_(list(F1.parameters()) + list(F2.parameters()) + list(router.parameters()), max_norm=1.0)
+                # torch.nn.utils.clip_grad_norm_(list(F1.parameters()) + list(F2.parameters()) + list(Router.parameters()), max_norm=1.0)
                 #
                 # opt_g.step()
                 # opt_f.step()
@@ -436,7 +435,7 @@ def train(args):
                 # STEP A: Train Everything on Source Data (Minimize Regression Error)
                 # =============================================================
                 feat_s = G(X_s)
-                sub1_s, sub2_s = router(feat_s)
+                sub1_s, sub2_s = Router(feat_s)
                 pred_s1 = F1(sub1_s)
                 pred_s2 = F2(sub2_s)
 
@@ -457,8 +456,8 @@ def train(args):
                 feat_s = G(X_s).detach()
                 feat_t = G(X_t).detach()
 
-                sub1_s, sub2_s = router(feat_s)
-                sub1_t, sub2_t = router(feat_t)
+                sub1_s, sub2_s = Router(feat_s)
+                sub1_t, sub2_t = Router(feat_t)
 
                 pred_s1 = F1(sub1_s)
                 pred_s2 = F2(sub2_s)
@@ -484,7 +483,7 @@ def train(args):
                 # =============================================================
                 # We do NOT detach G here. We freeze the router and heads.
                 feat_t = G(X_t)
-                sub1_t, sub2_t = router(feat_t)
+                sub1_t, sub2_t = Router(feat_t)
                 pred_t1 = F1(sub1_t)
                 pred_t2 = F2(sub2_t)
 
@@ -510,12 +509,11 @@ def train(args):
             scheduler_f.step()
 
             n = stats["n"]
-            # da_str = "ON " if da_active else "OFF"
             print(f"Epoch {epoch:03d}/{args.epochs} " #DA:{da_str}  "
                   f"MSE1={stats['mse1'] / n:.4f}  MSE2={stats['mse2'] / n:.4f}  "
                   f"Dis={stats['dis'] / n:.4f}  Var={stats['var'] / n:.4f}")
 
-            mae, rmse, r2, corr = evaluate(G, router, F1, F2, val_loader, device, normalizer)
+            mae, rmse, r2, corr = evaluate(G, Router, F1, F2, val_loader, device, normalizer)
             print(f"  MAE={mae:.4f}  RMSE={rmse:.4f}  R²={r2:.4f} Corr.={corr:.4f}" )
 
             mlflow.log_metrics(
@@ -536,12 +534,9 @@ def train(args):
                 best_mae = mae
                 print(f"new best MAE: {best_mae:.4f}")
 
-            # Log checkpoint at the end of each epoch
-            # mlflow.pytorch.log_model(G, name=f"G_checkpoint_{epoch}")
-            # mlflow.pytorch.log_model(F1, name=f"F1_checkpoint_{epoch}")
-            # mlflow.pytorch.log_model(F2, name=f"F1_checkpoint_{epoch}")
-
     print(f"Done. Best MAE on target val: {best_mae:.4f}")
+
+import itertools
 
 def parse_args():
     p = argparse.ArgumentParser(description="DRT")
@@ -551,19 +546,44 @@ def parse_args():
     p.add_argument("--source_x_dicts", type=str, default="X_anim3.csv,X_anim4.csv,X_anim8.csv,X_anim10.csv")
     p.add_argument("--source_y_dicts", type=str, default="Y_anim3.csv,Y_anim4.csv,Y_anim8.csv,Y_anim10.csv")
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=50,
-                   help="Epochs of source-only training before DA losses activate")
+    p.add_argument("--warmup_epochs", type=int, default=40, help="Epochs of source-only training")
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=0.0005, help="backbone lr")
-    p.add_argument("--lr_f", type=float, default=0.001, help="head lr")
+    p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
+    p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
     p.add_argument("--lmbd", type=float, default=0.25, help="grad reversal λ")
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
     p.add_argument("--input_dim", type=int, default=14)
     p.add_argument("--hidden_dim", type=int, default=128)
-    p.add_argument("--schedule", type=int, nargs="+", default=[120, 140, 148])
+    p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
+    p.add_argument("--simulate", type=bool, default=False)
     return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    train(args)
+
+    # hyperparams
+    param_grid = {
+        "warmup_epochs": [60, 80, 100],
+        "eta": [0.1, 0.3, 0.5],
+        "gamma": [0.005, 0.02, 0.05]
+    }
+
+    keys, values = zip(*param_grid.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+    for idx, config in enumerate(combinations, 1):
+        args.warmup_epochs = config["warmup_epochs"]
+        args.eta = config["eta"]
+        args.gamma = config["gamma"]
+
+
+        args.schedule = [
+            int(args.epochs * 0.75),
+            int(args.epochs * 0.90),
+            int(args.epochs * 0.96)
+        ]
+
+        train(args)
+
+
