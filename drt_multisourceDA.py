@@ -4,16 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset
 import argparse
 import os
 from scipy.stats import pearsonr
 import mlflow
+import itertools
 
 def load_csv(path):
-    """
-    load a CSV file into a numpy float32 array
-    """
+
     rows = []
     with open(path, "r") as f:
         reader = csv.reader(f)
@@ -23,9 +22,6 @@ def load_csv(path):
     return np.array(rows, dtype=np.float32)
 
 def load_data(x_path, y_path):
-    """
-    load X and Y data.
-    """
     X = load_csv(x_path)
     Y = load_csv(y_path).squeeze(1)
 
@@ -35,10 +31,6 @@ def load_data(x_path, y_path):
     return X, Y
 
 class Normalizer:
-    """
-    fit on source domain, apply to all domains
-    normalises X feature-wise and Y globally
-    """
     def __init__(self):
         self.X_mean = self.X_std = None
         self.Y_mean = self.Y_std = None
@@ -60,9 +52,7 @@ class Normalizer:
         return Y_norm * self.Y_std + self.Y_mean
 
 def split_domain(X, Y, val_ratio=0.2, seed=100):
-    """
-    split a domain into train / val portions
-    """
+
     n = len(X)
     idx = np.random.default_rng(seed).permutation(n)
     n_val = int(n * val_ratio)
@@ -70,111 +60,75 @@ def split_domain(X, Y, val_ratio=0.2, seed=100):
     return (X[train_idx], Y[train_idx]), (X[val_idx], Y[val_idx])
 
 def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
-    """
-    create DataLoader
-    """
+
     X_t = torch.tensor(X, dtype=torch.float32)
     Y_t = torch.tensor(Y, dtype=torch.float32)
     ds  = TensorDataset(X_t, Y_t)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       drop_last=drop_last)
 
-class GradReverse(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, lmbd):
-        ctx.lmbd = lmbd
-        return x.view_as(x)
+class ChannelAttention1d(nn.Module):
+    def __init__(self, dim, reduction=16):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(dim, dim // reduction, bias=False),
+            nn.ReLU(),
+            nn.Linear(dim // reduction, dim, bias=False),
+            nn.Sigmoid()
+        )
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.lmbd, None
+    def forward(self, x):
+        attention_weights = self.fc(x)
+        return x * attention_weights
 
-
-def grad_reverse(x, lmbd=1.0):
-    return GradReverse.apply(x, lmbd)
-
-# class Backbone(nn.Module):
-#     """
-#     MLP backbone replacing the dynamic ResNet-101
-#     takes 14 features, outputs a hidden representation
-#     """
-#     def __init__(self, in_dim=14, hidden_dim=128, dropout=0.2):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(in_dim, 256),
-#             nn.BatchNorm1d(256),
-#             nn.ReLU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(256, hidden_dim),
-#             nn.BatchNorm1d(hidden_dim),
-#             nn.ReLU(),
-#         )
-#
-#     def forward(self, x):
-#         return self.net(x)
-
-# class DynamicBackbone(nn.Module):
-#     def __init__(self, in_dim=14, hidden_dim=128):
-#         super().__init__()
-#         self.encoder = nn.Sequential(
-#             nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.ReLU()
-#         )
-#         # attention network  generates per-sample feature weights
-#         self.attention = nn.Sequential(
-#             nn.Linear(256, 64), nn.ReLU(),
-#             nn.Linear(64, 256), nn.Sigmoid()   # weights in [0,1]
-#         )
-#         self.out = nn.Sequential(
-#             nn.Linear(256, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU()
-#         )
-#
-#     def forward(self, x):
-#         h = self.encoder(x)
-#         alpha = self.attention(h)   # input-conditioned weights
-#         h = h * alpha               # channel attention
-#         return self.out(h)
 
 class DynamicLinear(nn.Module):
-    def __init__(self, in_dim, out_dim, K=4):
+    def __init__(self, in_features, out_features, K=4):
         super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
         self.K = K
-        self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim)) #static part
-        self.static_bias = nn.Parameter(torch.Tensor(out_dim))
-        self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim)) # dynamic part
-        # K are the residual matrices
 
-        nn.init.kaiming_uniform_(self.static_weight, a=np.sqrt(5))
-        nn.init.zeros_(self.static_bias)  #
-        nn.init.zeros_(self.residual_weights) #initialize residual matrices
+        # Matrix bank containing K independent weight spaces
+        self.weight_bank = nn.Parameter(torch.randn(K, out_features, in_features))
+        self.bias_bank = nn.Parameter(torch.zeros(K, out_features))
+
+        # Initialize weights cleanly
+        nn.init.kaiming_uniform_(self.weight_bank, a=np.sqrt(5))
+
 
     def forward(self, x, routing_weights):
-        # multiply the residuals by there percentages and add them up
-        res_w = torch.einsum('bk,kij->bij', routing_weights, self.residual_weights)
-        weight = self.static_weight.unsqueeze(0) + res_w  # [B, out_dim, in_dim] add static weight with dynamic weight
+        # x: [B, In_Features]
+        # routing_weights: [B, K]
 
-        # use batch matrix multiplication
-        out = torch.bmm(x.unsqueeze(1), weight.transpose(1, 2)).squeeze(1)
-        out = out + self.static_bias
+        # Linearly blend the weight matrices per sample based on routing paths
+        blended_weight = torch.einsum('bk,kof->bof', routing_weights, self.weight_bank)
+        blended_bias = torch.einsum('bk,ko->bo', routing_weights, self.bias_bank)
+
+        # Batch matrix multiplication to apply custom weights to each sample
+        out = torch.bmm(blended_weight, x.unsqueeze(-1)).squeeze(-1) + blended_bias
         return out
 
 
 class DynamicBackbone(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=128, K=4):
+    def __init__(self, in_dim=14, hidden_dim=256, K=4):
         super().__init__()
         self.K = K
 
-        #extracts features
+        # Your updated Constant-Width Encoder with Channel Attention
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, 256),
-            nn.BatchNorm1d(256), # prevents exploding gradients and covariance shift
-            nn.ReLU(),
-            nn.Linear(256,256),
             nn.BatchNorm1d(256),
-            nn.ReLU()
+            nn.ReLU(),
+            ChannelAttention1d(256),  # Recalibrate Layer 1 features
+
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            ChannelAttention1d(256)  # Recalibrate Layer 2 features
         )
 
-        # predicts the π coefficients for the dynamic weights
-        # uses softmax so they sum to 1
+        # Subspace Routing coefficients
         self.routing_net = nn.Sequential(
             nn.Linear(256, 64),
             nn.ReLU(),
@@ -182,69 +136,151 @@ class DynamicBackbone(nn.Module):
             nn.Softmax(dim=-1)
         )
 
+        # Dynamic layer performing the custom coordinate warping
         self.dynamic_layer = DynamicLinear(256, hidden_dim, K=K)
-
-        # output
         self.bn_out = nn.BatchNorm1d(hidden_dim)
         self.relu_out = nn.ReLU()
 
     def forward(self, x):
-        # extract base features
-        h = self.encoder(x)
-
-        # generate sample-conditioned routing weights π(x)
-        routing_weights = self.routing_net(h)  # [batch_size, K]
-
-        h_dyn = self.dynamic_layer(h, routing_weights)
-
-        return self.relu_out(self.bn_out(h_dyn))
+        feat = self.encoder(x)
+        pi = self.routing_net(feat)  # Get routing coefficients
+        out = self.dynamic_layer(feat, pi)
+        out = self.relu_out(self.bn_out(out))
+        return out
 
 class SubspaceRouter(nn.Module):
-    """
-    splitting of latent features into two subspaces for F!/F2
-    """
-    def __init__(self, hidden_dim=128):
+    def __init__(self, in_dim=256, out_dim=128):
         super().__init__()
-        self.proj1 = nn.Linear(hidden_dim, hidden_dim)
-        self.proj2 = nn.Linear(hidden_dim, hidden_dim)
+        self.split1 = nn.Linear(in_dim, out_dim)
+        self.split2 = nn.Linear(in_dim, out_dim)
 
-    def forward(self, feat):
-        return self.proj1(feat), self.proj2(feat)
+    def forward(self, x):
+        return self.split1(x), self.split2(x)
 
 
-class RegressionHead(nn.Module):
-    """
-    Regression head replacing ResClassifier
-    outputs a single continuous prediction.
-    """
-    def __init__(self, hidden_dim=128, lmbd=0.25):
+class RegressorHead(nn.Module):
+    def __init__(self, in_dim=128):
         super().__init__()
-        self.lmbd = lmbd
         self.net = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+            nn.Linear(in_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(64, 1)
         )
 
-    def forward(self, feat, reverse=False):
-        x = grad_reverse(feat, self.lmbd) if reverse else feat
-        return self.net(x).squeeze(1)
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
 
-def discrepancy_loss(pred1, pred2):
-    """
-    replaces softmax
-    mean absolute difference between the two heads
-    between 0 and 1
-    """
-    return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
 
-def variance_penalty(pred1, pred2):
-    """
-    replaces entropy minimisation
-    prevents predicting mean for everything
-    is negative gets subtracted from loss
-    """
-    return -(torch.var(pred1) + torch.var(pred2))
+# class DynamicLinear(nn.Module):
+#     def __init__(self, in_dim, out_dim, K=4):
+#         super().__init__()
+#         self.K = K
+#         self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim)) #static part
+#         self.static_bias = nn.Parameter(torch.Tensor(out_dim))
+#         self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim)) # dynamic part
+#
+#         nn.init.kaiming_uniform_(self.static_weight, a=np.sqrt(5))
+#         nn.init.zeros_(self.static_bias)  #
+#         nn.init.zeros_(self.residual_weights) #initialize residual matrices
+#
+#     def forward(self, x, routing_weights):
+#         # multiply the residuals by there percentages and add them up
+#         res_w = torch.einsum('bk,kij->bij', routing_weights, self.residual_weights)
+#         weight = self.static_weight.unsqueeze(0) + res_w  # [B, out_dim, in_dim] add static weight with dynamic weight
+#
+#         # use batch matrix multiplication
+#         out = torch.bmm(x.unsqueeze(1), weight.transpose(1, 2)).squeeze(1)
+#         out = out + self.static_bias
+#         return out
+
+
+# class DynamicBackbone(nn.Module):
+#     def __init__(self, in_dim=14, hidden_dim=128, K=4):
+#         super().__init__()
+#         self.K = K
+#
+#         #extracts features
+#         self.encoder = nn.Sequential(
+#             nn.Linear(in_dim, 256),
+#             nn.BatchNorm1d(256), # prevents exploding gradients and covariance shift
+#             nn.ReLU(),
+#             nn.Linear(256,256),
+#             nn.BatchNorm1d(256),
+#             nn.ReLU()
+#         )
+#
+#         # predicts the π coefficients for the dynamic weights
+#         # uses softmax so they sum to 1
+#         self.routing_net = nn.Sequential(
+#             nn.Linear(256, 64),
+#             nn.ReLU(),
+#             nn.Linear(64, K),
+#             nn.Softmax(dim=-1)
+#         )
+#
+#         self.dynamic_layer = DynamicLinear(256, hidden_dim, K=K)
+#
+#         # output
+#         self.bn_out = nn.BatchNorm1d(hidden_dim)
+#         self.relu_out = nn.ReLU()
+#
+#     def forward(self, x):
+#         # extract base features
+#         h = self.encoder(x)
+#
+#         # generate sample-conditioned routing weights π(x)
+#         routing_weights = self.routing_net(h)  # [batch_size, K]
+#
+#         h_dyn = self.dynamic_layer(h, routing_weights)
+#
+#         return self.relu_out(self.bn_out(h_dyn))
+
+# class SubspaceRouter(nn.Module):
+#     """
+#     splitting of latent features into two subspaces for F!/F2
+#     """
+#     def __init__(self, hidden_dim=128):
+#         super().__init__()
+#         self.proj1 = nn.Linear(hidden_dim, hidden_dim)
+#         self.proj2 = nn.Linear(hidden_dim, hidden_dim)
+#
+#     def forward(self, feat):
+#         return self.proj1(feat), self.proj2(feat)
+
+
+# class RegressionHead(nn.Module):
+#     """
+#     Regression head replacing ResClassifier
+#     outputs a single continuous prediction.
+#     """
+#     def __init__(self, hidden_dim=128, lmbd=0.25):
+#         super().__init__()
+#         self.lmbd = lmbd
+#         self.net = nn.Sequential(
+#             nn.Linear(hidden_dim, 64),
+#             nn.ReLU(),
+#             nn.Linear(64, 1),
+#         )
+#
+#     def forward(self, feat, reverse=False):
+#         x = grad_reverse(feat, self.lmbd) if reverse else feat
+#         return self.net(x).squeeze(1)
+
+# def discrepancy_loss(pred1, pred2):
+#     """
+#     replaces softmax
+#     mean absolute difference between the two heads
+#     between 0 and 1
+#     """
+#     return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
+#
+# def variance_penalty(pred1, pred2):
+#     """
+#     replaces entropy minimisation
+#     prevents predicting mean for everything
+#     is negative gets subtracted from loss
+#     """
+#     return -(torch.var(pred1) + torch.var(pred2))
 
 
 @torch.no_grad()
@@ -268,7 +304,7 @@ def evaluate(G, Router, F1, F2, loader, device, normalizer):
     preds   = torch.cat(preds).numpy().flatten()
     targets = torch.cat(targets).numpy().flatten()
 
-    # Denormalise for interpretable metrics
+    # denormalise for interpretable metrics
     preds_orig   = normalizer.inverse_Y(preds)
     targets_orig = normalizer.inverse_Y(targets)
 
@@ -289,7 +325,6 @@ def train(args):
     mlflow.config.enable_system_metrics_logging()
     mlflow.config.set_system_metrics_sampling_interval(1)
 
-    # Define device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # load target domain and labels
@@ -299,14 +334,8 @@ def train(args):
 
     # load source domains
     source_domains = []
-    x_src_dicts =[]
-    y_src_dicts =[]
-
-    for x in args.source_x_dicts.split(","):
-        x_src_dicts.append(x)
-
-    for y in args.source_y_dicts.split(","):
-        y_src_dicts.append(y)
+    x_src_dicts = args.source_x_dicts.split(",")
+    y_src_dicts = args.source_y_dicts.split(",")
 
     for i in range(len(x_src_dicts)):
         source_x_path = os.path.join(args.data_dict_path, x_src_dicts[i])
@@ -329,7 +358,7 @@ def train(args):
 
     #split in train/eval
     (trg_train_X, trg_train_Y), (trg_val_X, trg_val_Y) = split_domain(
-            target_X_n, target_Y_n, val_ratio=0.2)
+            target_X_n, target_Y_n, val_ratio=0.2, seed = args.seed)
 
     #Dataloader
 
@@ -338,24 +367,32 @@ def train(args):
     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
                              shuffle=False, drop_last=False)
 
-    print(f"\nTotal Merged Source Samples: {len(X_src_n)}")
-    print(f"Target Training Samples:     {len(trg_train_X)}")
-    print(f"Target Validation Samples:   {len(trg_val_X)}")
 
-    G = DynamicBackbone(in_dim=args.input_dim, hidden_dim=args.hidden_dim).to(device)
-    F1 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
-    F2 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
-    Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
+    # G = DynamicBackbone(in_dim=args.input_dim, hidden_dim=args.hidden_dim).to(device)
+    # F1 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
+    # F2 = RegressionHead(hidden_dim=args.hidden_dim, lmbd=args.lmbd).to(device)
+    # Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
+    #
+    # opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    # opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()) + list(Router.parameters()), lr=args.lr_f, momentum=0.9, weight_decay=5e-4)
+    #
+    # scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
+    # scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
 
-    opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()) + list(Router.parameters()), lr=args.lr_f, momentum=0.9, weight_decay=5e-4)
+    G = DynamicBackbone(in_dim=14, hidden_dim=256, K=4)
+    Router = SubspaceRouter(in_dim=256, out_dim=128)
+    F1 = RegressorHead(in_dim=128)
+    F2 = RegressorHead(in_dim=128)
 
+    opt_g = optim.SGD(G.parameters(), lr=1e-3, momentum=0.9)
+    opt_f = optim.SGD(
+        list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()),
+        lr=1e-3, momentum=0.9
+    )
     scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
     scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
 
-    best_mae = float('inf')
 
-    print(f"\nMSDA training for {args.epochs} epochs (warmup: {args.warmup_epochs} epochs)\n")
 
     with mlflow.start_run() as run:
         # Log training parameters
@@ -369,24 +406,24 @@ def train(args):
             # da_active = epoch > args.warmup_epochs
             # da_weight = 1.0 if da_active else 0.0
 
-            if epoch <= args.warmup_epochs:
-                da_weight = 0.0
-            else:
-                da_weight = min(1.0, (epoch - args.warmup_epochs) / 20.0)
+            # if epoch <= args.warmup_epochs:
+            #     da_weight = 0.0
+            # else:
+            #     da_weight = min(1.0, (epoch - args.warmup_epochs) / 20.0)
+            #
+            # trg_iter = iter(trg_loader)
+            # stats = {"mse1": 0., "mse2": 0., "dis": 0., "var": 0., "n": 0}
+            #
+            # for X_s, Y_s in src_loader:
+            #     try:
+            #         X_t, _ = next(trg_iter)
+            #     except StopIteration:
+            #         trg_iter = iter(trg_loader)
+            #         X_t, _ = next(trg_iter)
 
-            trg_iter = iter(trg_loader)
-            stats = {"mse1": 0., "mse2": 0., "dis": 0., "var": 0., "n": 0}
-
-            for X_s, Y_s in src_loader:
-                try:
-                    X_t, _ = next(trg_iter)
-                except StopIteration:
-                    trg_iter = iter(trg_loader)
-                    X_t, _ = next(trg_iter)
-
-                X_s, Y_s = X_s.to(device), Y_s.to(device)
-                X_t = X_t.to(device)
-                bsz = X_s.size(0)
+                # X_s, Y_s = X_s.to(device), Y_s.to(device)
+                # X_t = X_t.to(device)
+                # bsz = X_s.size(0)
 
                 # # ── Forward Passes ──
                 # data = torch.cat([X_s, X_t], dim=0)
@@ -440,74 +477,112 @@ def train(args):
 
                 #Train Everything on Source Data (Minimize Regression Error)
 
-                feat_s = G(X_s)
-                sub1_s, sub2_s = Router(feat_s)
-                pred_s1 = F1(sub1_s)
-                pred_s2 = F2(sub2_s)
+            #     feat_s = G(X_s)
+            #     sub1_s, sub2_s = Router(feat_s)
+            #     pred_s1 = F1(sub1_s)
+            #     pred_s2 = F2(sub2_s)
+            #
+            #     loss_s1 = F.mse_loss(pred_s1, Y_s)
+            #     loss_s2 = F.mse_loss(pred_s2, Y_s)
+            #     loss_stepA = loss_s1 + loss_s2
+            #
+            #     opt_g.zero_grad()
+            #     opt_f.zero_grad()
+            #     loss_stepA.backward()
+            #     opt_g.step()
+            #     opt_f.step()
+            #
+            #     # Train Router /Heads (Maximize Target Discrepancy)
+            #     # freeze backbone
+            #
+            #     feat_s = G(X_s).detach()
+            #     feat_t = G(X_t).detach()
+            #
+            #     sub1_s, sub2_s = Router(feat_s)
+            #     sub1_t, sub2_t = Router(feat_t)
+            #
+            #     pred_s1 = F1(sub1_s)
+            #     pred_s2 = F2(sub2_s)
+            #     pred_t1 = F1(sub1_t)
+            #     pred_t2 = F2(sub2_t)
+            #
+            #     loss_s1 = F.mse_loss(pred_s1, Y_s)
+            #     loss_s2 = F.mse_loss(pred_s2, Y_s)
+            #     dis = discrepancy_loss(pred_t1, pred_t2)
+            #     vpen = variance_penalty(pred_t1, pred_t2)
+            #
+            #     # Notice the MINUS sign before 'dis'. Minimizing a negative
+            #     # loss maximizes the discrepancy, forcing the heads to find different boundaries.
+            #     loss_stepB = (loss_s1 + loss_s2) + da_weight * (args.gamma * vpen - args.eta * dis)
+            #
+            #     opt_g.zero_grad()
+            #     opt_f.zero_grad()
+            #     loss_stepB.backward()
+            #     opt_f.step()  # ONLY optimize Router, F1, and F2
+            #
+            #     # Train Backbone G (Minimize Target Discrepancy)
+            #     # We do NOT detach G here. We freeze the router and heads.
+            #
+            #
+            #     feat_t = G(X_t)
+            #     sub1_t, sub2_t = Router(feat_t)
+            #     pred_t1 = F1(sub1_t)
+            #     pred_t2 = F2(sub2_t)
+            #
+            #     dis = discrepancy_loss(pred_t1, pred_t2)
+            #     vpen = variance_penalty(pred_t1, pred_t2)
+            #
+            #     # Notice the PLUS sign before 'dis'. G wants to minimize
+            #     # discrepancy, pushing target features into areas where F1 and F2 agree.
+            #     loss_step3 = da_weight * (args.eta * dis + args.gamma * vpen)
+            #
+            #     opt_g.zero_grad()
+            #     opt_f.zero_grad()
+            #     loss_step3.backward()
+            #     opt_g.step()  # ONLY optimize Backbone G
+            #
+            #     stats["mse1"] += loss_s1.item() * bsz
+            #     stats["mse2"] += loss_s2.item() * bsz
+            #     stats["dis"] += dis.item() * bsz
+            #     stats["var"] += vpen.item() * bsz
+            #     stats["n"] += bsz
+            #
+            # scheduler_g.step()
+            # scheduler_f.step()
 
+            G.train()
+            Router.train()
+            F1.train()
+            F2.train()
+
+            # Initialize tracking statistics for the epoch
+            stats = {"mse1": 0.0, "mse2": 0.0, "n": 0}
+
+            for X_s, Y_s in src_loader:
+                bsz = X_s.size(0)
+
+                #Forward Pass
+                feat_s = G(X_s)  # Includes Channel Attention & Subspace Routing
+                sub1_s, sub2_s = Router(feat_s)  # Splitting features
+                pred_s1 = F1(sub1_s)  # Head 1 prediction
+                pred_s2 = F2(sub2_s)  # Head 2 prediction
+
+                # Task Loss Calculation
                 loss_s1 = F.mse_loss(pred_s1, Y_s)
                 loss_s2 = F.mse_loss(pred_s2, Y_s)
                 loss_stepA = loss_s1 + loss_s2
 
+                #Standard Backpropagation
                 opt_g.zero_grad()
                 opt_f.zero_grad()
+
                 loss_stepA.backward()
+
                 opt_g.step()
                 opt_f.step()
 
-                # Train Router /Heads (Maximize Target Discrepancy)
-                # freeze backbone
-
-                feat_s = G(X_s).detach()
-                feat_t = G(X_t).detach()
-
-                sub1_s, sub2_s = Router(feat_s)
-                sub1_t, sub2_t = Router(feat_t)
-
-                pred_s1 = F1(sub1_s)
-                pred_s2 = F2(sub2_s)
-                pred_t1 = F1(sub1_t)
-                pred_t2 = F2(sub2_t)
-
-                loss_s1 = F.mse_loss(pred_s1, Y_s)
-                loss_s2 = F.mse_loss(pred_s2, Y_s)
-                dis = discrepancy_loss(pred_t1, pred_t2)
-                vpen = variance_penalty(pred_t1, pred_t2)
-
-                # Notice the MINUS sign before 'dis'. Minimizing a negative
-                # loss maximizes the discrepancy, forcing the heads to find different boundaries.
-                loss_stepB = (loss_s1 + loss_s2) + da_weight * (args.gamma * vpen - args.eta * dis)
-
-                opt_g.zero_grad()
-                opt_f.zero_grad()
-                loss_stepB.backward()
-                opt_f.step()  # ONLY optimize Router, F1, and F2
-
-                # Train Backbone G (Minimize Target Discrepancy)
-                # We do NOT detach G here. We freeze the router and heads.
-
-
-                feat_t = G(X_t)
-                sub1_t, sub2_t = Router(feat_t)
-                pred_t1 = F1(sub1_t)
-                pred_t2 = F2(sub2_t)
-
-                dis = discrepancy_loss(pred_t1, pred_t2)
-                vpen = variance_penalty(pred_t1, pred_t2)
-
-                # Notice the PLUS sign before 'dis'. G wants to minimize
-                # discrepancy, pushing target features into areas where F1 and F2 agree.
-                loss_step3 = da_weight * (args.eta * dis + args.gamma * vpen)
-
-                opt_g.zero_grad()
-                opt_f.zero_grad()
-                loss_step3.backward()
-                opt_g.step()  # ONLY optimize Backbone G
-
                 stats["mse1"] += loss_s1.item() * bsz
                 stats["mse2"] += loss_s2.item() * bsz
-                stats["dis"] += dis.item() * bsz
-                stats["var"] += vpen.item() * bsz
                 stats["n"] += bsz
 
             scheduler_g.step()
@@ -516,7 +591,7 @@ def train(args):
             n = stats["n"]
             print(f"Epoch {epoch:03d}/{args.epochs} " #DA:{da_str}  "
                   f"MSE1={stats['mse1'] / n:.4f}  MSE2={stats['mse2'] / n:.4f}  "
-                  f"Dis={stats['dis'] / n:.4f}  Var={stats['var'] / n:.4f}")
+                  )
 
             mae, rmse, r2, corr = evaluate(G, Router, F1, F2, val_loader, device, normalizer)
             print(f"  MAE={mae:.4f}  RMSE={rmse:.4f}  R²={r2:.4f} Corr.={corr:.4f}" )
@@ -525,8 +600,6 @@ def train(args):
                 {
                     "MSE1": stats['mse1']/n,
                     "MSE2": stats['mse2']/n,
-                    "Dis": stats['dis']/n,
-                    "Var": stats['var']/n,
                     "MAE": mae,
                     "RMSE": rmse,
                     "R²": r2,
@@ -534,22 +607,16 @@ def train(args):
                 },
                 step=epoch,
             )
+    return r2
 
-            if mae < best_mae:
-                best_mae = mae
-                print(f"new best MAE: {best_mae:.4f}")
-
-    print(f"Done. Best MAE on target val: {best_mae:.4f}")
-
-import itertools
 
 def parse_args():
     p = argparse.ArgumentParser(description="DRT")
     p.add_argument("--data_dict_path", type=str, default="C:/Users/leona/PythonScripts/MasterThesis/Tierdaten/")
     p.add_argument("--target_x_dict", type=str, default="X_anim1.csv")
     p.add_argument("--target_y_dict", type=str, default="Y_anim1.csv")
-    p.add_argument("--source_x_dicts", type=str, default="X_anim3.csv,X_anim4.csv,X_anim8.csv,X_anim10.csv")
-    p.add_argument("--source_y_dicts", type=str, default="Y_anim3.csv,Y_anim4.csv,Y_anim8.csv,Y_anim10.csv")
+    p.add_argument("--source_x_dicts", type=str, default="X_anim10.csv,X_anim3.csv,X_anim4.csv,X_anim8.csv")
+    p.add_argument("--source_y_dicts", type=str, default="Y_anim10.csv,Y_anim3.csv,Y_anim4.csv,Y_anim8.csv")
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--warmup_epochs", type=int, default=100, help="Epochs of source-only training")
     p.add_argument("--batch_size", type=int, default=64)
@@ -561,36 +628,81 @@ def parse_args():
     p.add_argument("--input_dim", type=int, default=14)
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
-    p.add_argument("--simulate", type=bool, default=False)
+    p.add_argument("--seed", type=int, default=100)
+    p.add_argument("--MCD_activated", type=bool, default=False, help="If False source only")
+    p.add_argument("--DRT_activated", type=bool, default=False)
+    p.add_argument("--ST_activated", type=bool, default=False)
+
     return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # hyperparams
-    # param_grid = {
-    #     "warmup_epochs": [60, 80, 100],
-    #     "eta": [0.1, 0.3, 0.5],
-    #     "gamma": [0.005, 0.02, 0.05]
-    # }
-    #
-    # keys, values = zip(*param_grid.items())
-    # combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
-    #
-    # for idx, config in enumerate(combinations, 1):
-    #     args.warmup_epochs = config["warmup_epochs"]
-    #     args.eta = config["eta"]
-    #     args.gamma = config["gamma"]
-    #
-    #
-    #     args.schedule = [
-    #         int(args.epochs * 0.75),
-    #         int(args.epochs * 0.90),
-    #         int(args.epochs * 0.96)
-    #     ]
-    #
-    #     train(args)
+    seeds = [100,200,74,15,984]
 
-    train (args)
+    x_src_dicts = args.source_x_dicts.split(",")
+    y_src_dicts = args.source_y_dicts.split(",")
+
+    x_dicts = [args.target_x_dict] + x_src_dicts
+    y_dicts = [args.target_y_dict] + y_src_dicts
+
+    animal_pool = list(zip(x_dicts, y_dicts))
+
+    final_summary = {}
+    all_target_means = []
+
+    combinations = [
+        {"MCD_activated": mcd, "DRT_activated": drt, "ST_activated": st}
+        for mcd, drt, st in itertools.product([False, True], [False, True], [False, True])
+        if not (st and not drt)
+    ]
+
+    for idx, config in enumerate(combinations, 1):
+        args.MCD_activated = config["MCD_activated"]
+        args.DRT_activated = config["DRT_activated"]
+        args.ST_activated = config["ST_activated"]
+
+        for target_x, target_y in animal_pool:
+
+            target_name = target_x.replace("X_", "").replace(".csv", "")
+
+            sources = [pair for pair in animal_pool if pair != (target_x, target_y)]
+
+            sources_x_str = ",".join([pair[0] for pair in sources])
+            sources_y_str = ",".join([pair[1] for pair in sources])
+
+            args.target_x_dict = target_x
+            args.target_y_dict = target_y
+            args.source_x_dicts = sources_x_str
+            args.source_y_dicts = sources_y_str
+
+            seed_r2s = []
+
+            for i in range(len(seeds)):
+                args.seed = seeds[i]
+                run_r2 = train(args)
+                seed_r2s.append(run_r2)
+
+            mean = np.mean(seed_r2s)
+            std = np.std(seed_r2s, ddof=1) # sample std
+
+            final_summary[target_name] = (mean, std)
+            all_target_means.append(mean)
+            print(f"Finished Target {target_name}! Result: {mean:.4f} ± {std:.4f}")
+
+        print(f"Results for configuration: {config}: ")
+        print("-" * 40)
+
+        for target_name, (mean, std) in final_summary.items():
+            print(f"Target: {target_name}")
+            print(f"{mean:.4f} ± {std:.4f}")
+            print("-" * 40)
+
+        average_all = np.mean(all_target_means)
+        std_all = np.std(all_target_means, ddof=1)
+        print(f"Average Across All Targets:")
+        print(f"{average_all:.4f}± {std_all:.4f}")
+        print("=" * 40)
+
 
 
