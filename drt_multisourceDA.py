@@ -332,7 +332,6 @@ def train(args):
 
                 #logg params
                 st_keep_rate = 0.0
-                loss_st_val = 0.0
 
                 # Self-Training Block
                 if args.ST_activated and epoch > args.warmup_epochs: # use st only after warmup to not train on incorrect predictions
@@ -380,8 +379,7 @@ def train(args):
                                 F.mse_loss(pred_t1_conf, pseudo_Y[confident_mask]) +
                                 F.mse_loss(pred_t2_conf, pseudo_Y[confident_mask])
                         )
-                        loss_stepA += da_weight * loss_st # scale depending on warmup
-                        loss_st_val = loss_st.item() # just for logging
+                        loss_stepA += da_weight * loss_st # scale depending on warmup for MCD
 
                 opt_g.zero_grad()
                 opt_f.zero_grad()
@@ -389,9 +387,9 @@ def train(args):
                 opt_g.step()
                 opt_f.step()
 
-                # ── STEPS B & C: Maximum Classifier Discrepancy (Only runs if MCD is active) ──
+                # Step B and C only for MCD
                 if args.MCD_activated:
-                    # --- Step B: Train Router / Heads (Maximize Target Discrepancy) ---
+                    # Step B: Train Router / Heads (Maximize Target Discrepancy)
                     # Freeze backbone G
                     for p in G.parameters(): p.requires_grad = False
                     for p in list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()):
@@ -420,7 +418,7 @@ def train(args):
                     loss_stepB.backward()
                     opt_f.step()  # Only update Router & Heads
 
-                    # --- Step C: Train Backbone G (Minimize Target Discrepancy) ---
+                    # Step C: Train Backbone G (Minimize Target Discrepancy)
                     # Freeze Router and Heads
                     for p in G.parameters(): p.requires_grad = True
                     for p in list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()):
@@ -468,7 +466,7 @@ def train(args):
                 },
                 step=epoch,
             )
-    return r2
+    return r2, corr
 
 
 def parse_args():
@@ -510,7 +508,8 @@ if __name__ == "__main__":
     animal_pool = list(zip(x_dicts, y_dicts))
 
     final_summary = {}
-    all_target_means = []
+    all_target_r2_means = []
+    all_target_corr_means = []
 
     combinations = [
         {"MCD_activated": mcd, "DRT_activated": drt, "ST_activated": st}
@@ -537,19 +536,25 @@ if __name__ == "__main__":
             args.source_x_dicts = sources_x_str
             args.source_y_dicts = sources_y_str
 
-            seed_r2s = []
+            seed_r2 = []
+            seed_corr = []
 
             for i in range(len(seeds)):
                 args.seed = seeds[i]
-                run_r2 = train(args)
-                seed_r2s.append(run_r2)
+                run_r2, run_corr = train(args)
+                seed_r2.append(run_r2)
+                seed_corr.append(run_corr)
 
-            mean = np.mean(seed_r2s)
-            std = np.std(seed_r2s, ddof=1) # sample std
+            mean_r2 = np.mean(seed_r2)
+            std_r2 = np.std(seed_r2, ddof=1) # sample std
 
-            final_summary[target_name] = (mean, std)
-            all_target_means.append(mean)
-            print(f"Finished Target {target_name}! Result: {mean:.4f} ± {std:.4f}")
+            mean_corr =  np.mean(seed_corr)
+            std_corr = np.std(seed_corr, ddof=1)
+
+            final_summary[target_name] = (mean_r2, std_r2, mean_corr, std_corr)
+            all_target_r2_means.append(mean_r2)
+            all_target_corr_means.append(mean_corr)
+            print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
 
         output_file = "drt_training_results.txt"
 
@@ -559,15 +564,18 @@ if __name__ == "__main__":
             print(header, end="")
             f.write(header)
 
-            for target_name, (mean, std) in final_summary.items():
-                target_info = f"Target: {target_name}\n{mean:.4f} ± {std:.4f}\n" + "-" * 40 + "\n"
+            for target_name, (mean_r2, std_r2, mean_corr, std_corr) in final_summary.items():
+                target_info = f"Target: {target_name}\n R²: {mean_r2:.4f} ± {std_r2:.4f}\n Correlation: {mean_corr:.4f} ± {std_corr}\n" + "-" * 40 + "\n"
                 print(target_info, end="")
                 f.write(target_info)
 
-            average_all = np.mean(all_target_means)
-            std_all = np.std(all_target_means, ddof=1)
+            average_all_r2 = np.mean(all_target_r2_means)
+            std_all_r2 = np.std(all_target_r2_means, ddof=1)
 
-            footer = f"Average Across All Targets:\n{average_all:.4f} ± {std_all:.4f}\n" + "=" * 40 + "\n\n"
+            average_all_corr = np.mean(all_target_corr_means)
+            std_all_corr = np.std(all_target_corr_means, ddof=1)
+
+            footer = f"Average Across All Targets:\n R²: {average_all_r2:.4f} ± {std_all_r2:.4f}\n Correlation: {average_all_corr:.4f} ± {std_all_corr:.4f}\n" + "=" * 40 + "\n\n"
             print(footer, end="")
             f.write(footer)
 
