@@ -315,8 +315,8 @@ def train(args):
                         X_t, _ = next(trg_iter)
                     X_t = X_t.to(device)
 
-                # ── STEP A: Supervised Loss & (Optional) Self-Training ──
-                # Make sure all models calculate gradients
+                # Step A: supervised (and ST)
+                # calculate gradients
                 for p in G.parameters(): p.requires_grad = True
                 for p in list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()):
                     p.requires_grad = True
@@ -330,24 +330,47 @@ def train(args):
                 loss_s2 = F.mse_loss(pred_s2, Y_s)
                 loss_stepA = loss_s1 + loss_s2
 
-                # --- Modular Self-Training Block ---
-                if args.ST_activated:
-                    # Generate pseudo-labels under torch.no_grad
+                #logg params
+                st_keep_rate = 0.0
+                loss_st_val = 0.0
+
+                # Self-Training Block
+                if args.ST_activated and epoch > args.warmup_epochs: # use st only after warmup to not train on incorrect predictions
+                    # eval mode for turn off batch norm and dropout
+                    G.eval()
+                    Router.eval()
+                    F1.eval()
+                    F2.eval()
+
+                    # dont calculate gradients for pseudo-label generation
                     with torch.no_grad():
                         feat_t_st = G(X_t)
                         sub1_t_st, sub2_t_st = Router(feat_t_st)
                         pred_t1_st = F1(sub1_t_st)
                         pred_t2_st = F2(sub2_t_st)
 
-                        # Soft pseudo-label via ensemble average
+                        # pseudo-label via average
                         pseudo_Y = (pred_t1_st + pred_t2_st) / 2.0
 
-                        # Selection: Only self-train on samples with high consensus (low discrepancy)
+                        # uses consensus instead of confidence ->  distance head predictions
                         discrepancy = torch.abs(pred_t1_st - pred_t2_st)
-                        confident_mask = discrepancy < 0.1  # threshold (adjust dynamically if needed)
 
-                    if confident_mask.sum() > 0:
-                        # Forward pass with gradients on selected target data
+                        # dynamic threshold
+                        st_threshold = Y_s.std().item() * 0.1
+                        confident_mask = (discrepancy < st_threshold).squeeze(-1)
+
+                        # for logging
+                        st_keep_rate = confident_mask.float().mean().item()
+
+                    # switch back to gradient calculation for training
+                    G.train()
+                    Router.train()
+                    F1.train()
+                    F2.train()
+
+                    if confident_mask.sum() > 1: #only if we have more than two for batchnorm
+
+                        # forward pass with gradients on selected target data
                         feat_t_conf = G(X_t[confident_mask])
                         sub1_t_conf, sub2_t_conf = Router(feat_t_conf)
                         pred_t1_conf = F1(sub1_t_conf)
@@ -357,7 +380,8 @@ def train(args):
                                 F.mse_loss(pred_t1_conf, pseudo_Y[confident_mask]) +
                                 F.mse_loss(pred_t2_conf, pseudo_Y[confident_mask])
                         )
-                        loss_stepA += loss_st  # Accumulate self-training step
+                        loss_stepA += da_weight * loss_st # scale depending on warmup
+                        loss_st_val = loss_st.item() # just for logging
 
                 opt_g.zero_grad()
                 opt_f.zero_grad()
