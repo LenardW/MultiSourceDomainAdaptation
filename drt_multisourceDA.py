@@ -9,7 +9,6 @@ import argparse
 import os
 from scipy.stats import pearsonr
 import mlflow
-import itertools
 
 def load_csv(path):
 
@@ -90,7 +89,6 @@ class DynamicLinear(nn.Module):
         self.static_bias = nn.Parameter(torch.Tensor(out_dim))
         self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim))
 
-        # Clean initialization
         nn.init.kaiming_uniform_(self.static_weight, a=np.sqrt(5))
         nn.init.zeros_(self.static_bias)
         nn.init.zeros_(self.residual_weights)
@@ -117,6 +115,7 @@ class DynamicBackbone(nn.Module):
             nn.BatchNorm1d(256),
             nn.ReLU(),
             ChannelAttention1d(256),
+
             nn.Linear(256, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
@@ -416,7 +415,7 @@ def train(args):
 
                     opt_f.zero_grad()
                     loss_stepB.backward()
-                    opt_f.step()  # Only update Router & Heads
+                    opt_f.step()  # only update Router/ Heads
 
                     # Step C: Train Backbone G (Minimize Target Discrepancy)
                     # Freeze Router and Heads
@@ -481,7 +480,6 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
-    p.add_argument("--lmbd", type=float, default=0.25, help="grad reversal λ")
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
     p.add_argument("--input_dim", type=int, default=14)
@@ -511,11 +509,17 @@ if __name__ == "__main__":
     all_target_r2_means = []
     all_target_corr_means = []
 
-    combinations = [
-        {"MCD_activated": mcd, "DRT_activated": drt, "ST_activated": st}
-        for mcd, drt, st in itertools.product([False, True], [False, True], [False, True])
-        if not (st and not drt)
+    allowed_values = [
+        (False, False, False),
+        (False, True, False),
+        (False, True, True),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True)
     ]
+
+    keys = ["MCD_activated", "DRT_activated", "ST_activated"]
+    combinations = [dict(zip(keys, v)) for v in allowed_values]
 
     for idx, config in enumerate(combinations, 1):
         args.MCD_activated = config["MCD_activated"]
