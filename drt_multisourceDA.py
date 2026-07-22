@@ -505,14 +505,9 @@ if __name__ == "__main__":
 
     animal_pool = list(zip(x_dicts, y_dicts))
 
-    final_summary = {}
-    all_target_r2_means = []
-    all_target_corr_means = []
-
     allowed_values = [
         (False, False, False),
         (False, True, False),
-        (False, True, True),
         (True, False, False),
         (True, True, False),
         (True, True, True)
@@ -525,6 +520,10 @@ if __name__ == "__main__":
         args.MCD_activated = config["MCD_activated"]
         args.DRT_activated = config["DRT_activated"]
         args.ST_activated = config["ST_activated"]
+
+        final_summary = {}
+        all_target_r2_means = []
+        all_target_corr_means = []
 
         for target_x, target_y in animal_pool:
 
@@ -573,10 +572,10 @@ if __name__ == "__main__":
                 print(target_info, end="")
                 f.write(target_info)
 
-            average_all_r2 = np.mean(all_target_r2_means)
+            average_all_r2 = np.mean(all_target_r2_means, dtype=np.float64)
             std_all_r2 = np.std(all_target_r2_means, ddof=1)
 
-            average_all_corr = np.mean(all_target_corr_means)
+            average_all_corr = np.mean(all_target_corr_means, dtype=np.float64)
             std_all_corr = np.std(all_target_corr_means, ddof=1)
 
             footer = f"Average Across All Targets:\n R²: {average_all_r2:.4f} ± {std_all_r2:.4f}\n Correlation: {average_all_corr:.4f} ± {std_all_corr:.4f}\n" + "=" * 40 + "\n\n"
