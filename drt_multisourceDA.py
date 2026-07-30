@@ -67,19 +67,28 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
                       drop_last=drop_last)
 
 class ChannelAttention1d(nn.Module):
-    def __init__(self, dim, reduction=16):
+    def __init__(self, dim, reduction=16, drt_activated=True):
         super().__init__()
+        self.drt_activated = drt_activated
+        # We don't have the Squeeze step here from Squeeze-and-Excitation paper (Hu et al.)
+        # since we don't have spatial feature maps like in CNNs to summarize
         self.fc = nn.Sequential(
-            nn.Linear(dim, dim // reduction, bias=False),
+            nn.Linear(dim, dim // reduction, bias=False), # FC 256 -> 16
             nn.ReLU(),
-            nn.Linear(dim // reduction, dim, bias=False),
-            nn.Sigmoid()
+            # forced through a bottleneck to learn relationships
+            nn.Linear(dim // reduction, dim, bias=False), # FC 16 -> 256
+            nn.Sigmoid()    # output [0,1]
         )
 
     def forward(self, x):
+        if not self.drt_activated:
+            return x # static transfer: if not activated, nothing happens
         attention_weights = self.fc(x)
-        return x * attention_weights
-
+        # update: W(x) = W_0 + Λ(x) W_0 like in the DRT paper
+        return x + x * attention_weights # not x * attention_weights like in Squeeze-and-Excitation paper (Hu et al.)
+        # that could be a point to test if channel suppression or boosting works better
+        # also called residual gating
+        # can also try out = x * 2 * torch.sigmoid(weights) for [0,2]
 
 class DynamicLinear(nn.Module):
     def __init__(self, in_dim, out_dim, K=4):
@@ -112,14 +121,14 @@ class DynamicBackbone(nn.Module):
         # Feature extractor with Channel Attention
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, 256),
+            ChannelAttention1d(256, drt_activated=drt_activated), # dynamic weight combination before BN ReLu
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            ChannelAttention1d(256),
 
             nn.Linear(256, 256),
+            ChannelAttention1d(256, drt_activated=drt_activated),
             nn.BatchNorm1d(256),
-            nn.ReLU(),
-            ChannelAttention1d(256)
+            nn.ReLU()
         )
 
         # Predicts routing coefficients
@@ -508,6 +517,7 @@ if __name__ == "__main__":
     allowed_values = [
         (False, False, False),
         (False, True, False),
+        (False, True, True),
         (True, False, False),
         (True, True, False),
         (True, True, True)
