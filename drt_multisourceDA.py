@@ -66,103 +66,140 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       drop_last=drop_last)
 
-class ChannelAttention1d(nn.Module):
-    def __init__(self, dim, reduction=16, drt_activated=True):
+# class ChannelAttention1d(nn.Module):
+#     def __init__(self, dim, reduction=16, drt_activated=True):
+#         super().__init__()
+#         self.drt_activated = drt_activated
+#         # We don't have the Squeeze step here from Squeeze-and-Excitation paper (Hu et al.)
+#         # since we don't have spatial feature maps like in CNNs to summarize
+#         self.fc = nn.Sequential(
+#             nn.Linear(dim, dim // reduction, bias=False), # FC 256 -> 16
+#             nn.ReLU(),
+#             # forced through a bottleneck to learn relationships
+#             nn.Linear(dim // reduction, dim, bias=False), # FC 16 -> 256
+#             nn.Sigmoid()    # output [0,1]
+#         )
+#
+#     def forward(self, x):
+#         if not self.drt_activated:
+#             return x # static transfer: if not activated, nothing happens
+#         attention_weights = self.fc(x)
+#         # update: W(x) = W_0 + Λ(x) W_0 like in the DRT paper
+#         return x + x * attention_weights # not x * attention_weights like in Squeeze-and-Excitation paper (Hu et al.)
+#         # that could be a point to test if channel suppression or boosting works better
+#         # also called residual gating
+#         # can also try out = x * 2 * torch.sigmoid(weights) for [0,2]
+
+class DynamicLinear(nn.Module):
+    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True):
         super().__init__()
+        self.K = K
         self.drt_activated = drt_activated
-        # We don't have the Squeeze step here from Squeeze-and-Excitation paper (Hu et al.)
-        # since we don't have spatial feature maps like in CNNs to summarize
-        self.fc = nn.Sequential(
-            nn.Linear(dim, dim // reduction, bias=False), # FC 256 -> 16
-            nn.ReLU(),
-            # forced through a bottleneck to learn relationships
-            nn.Linear(dim // reduction, dim, bias=False), # FC 16 -> 256
-            nn.Sigmoid()    # output [0,1]
-        )
+
+        #static component
+        self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim))
+        self.static_bias = nn.Parameter(torch.Tensor(out_dim))
+        nn.init.kaiming_uniform_(self.static_weight, a=np.sqrt(5))
+        nn.init.zeros_(self.static_bias)
+
+        # basis matrices for subspace routing
+        self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim))
+        nn.init.zeros_(self.residual_weights)
+
+        # ONE shared lightweight branch feeds both Λ(x) and π(x),
+        # mirroring the single attention branch in the paper's Fig. 3
+        hidden = max(in_dim // reduction, 4) # need explanation for that, why use for both
+        self.branch = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
+        self.to_lambda = nn.Linear(hidden, out_dim)   # -> sigmoid, Λ(x)
+        self.to_pi     = nn.Linear(hidden, K)          # -> softmax, π(x)
 
     def forward(self, x):
         if not self.drt_activated:
-            return x # static transfer: if not activated, nothing happens
-        attention_weights = self.fc(x)
-        # update: W(x) = W_0 + Λ(x) W_0 like in the DRT paper
-        return x + x * attention_weights # not x * attention_weights like in Squeeze-and-Excitation paper (Hu et al.)
-        # that could be a point to test if channel suppression or boosting works better
-        # also called residual gating
-        # can also try out = x * 2 * torch.sigmoid(weights) for [0,2]
+            return F.linear(x, self.static_weight, self.static_bias)
 
-class DynamicLinear(nn.Module):
-    def __init__(self, in_dim, out_dim, K=4):
-        super().__init__()
-        self.K = K
-        self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim))
-        self.static_bias = nn.Parameter(torch.Tensor(out_dim))
-        self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim))
+        h = self.branch(x)
+        lam = torch.sigmoid(self.to_lambda(h))           # [B, out_dim]
+        pi  = torch.softmax(self.to_pi(h), dim=-1)        # [B, K]
 
-        nn.init.kaiming_uniform_(self.static_weight, a=np.sqrt(5))
-        nn.init.zeros_(self.static_bias)
-        nn.init.zeros_(self.residual_weights)
+        lam_term = lam.unsqueeze(-1) * self.static_weight.unsqueeze(0)     # Λ(x)W_0, per sample
+        pi_term  = torch.einsum('bk,kij->bij', pi, self.residual_weights)  # Σπ_i(x)Φ_i
 
-    def forward(self, x, routing_weights):
-        # Dynamically blend residual weights per sample based on routing paths
-        res_w = torch.einsum('bk,kij->bij', routing_weights, self.residual_weights)
-        weight = self.static_weight.unsqueeze(0) + res_w  # [B, out_dim, in_dim]
+        weight = self.static_weight.unsqueeze(0) + lam_term + pi_term
+        return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
 
-        # Batch matrix multiplication: applying custom blended weights to each sample
-        out = torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
-        return out
-
+        # # Dynamically blend residual weights per sample based on routing paths
+        # res_w = torch.einsum('bk,kij->bij', routing_weights, self.residual_weights)
+        # weight = self.static_weight.unsqueeze(0) + res_w  # [B, out_dim, in_dim]
+        #
+        # # Batch matrix multiplication: applying custom blended weights to each sample
+        # return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
 
 class DynamicBackbone(nn.Module):
     def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True):
         super().__init__()
-        self.K = K
-        self.drt_activated = drt_activated
+        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated)
+        self.bn1, self.relu1 = nn.BatchNorm1d(256), nn.ReLU()
 
-        # Feature extractor with Channel Attention
-        self.encoder = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            ChannelAttention1d(256, drt_activated=drt_activated), # dynamic weight combination before BN ReLu
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-
-            nn.Linear(256, 256),
-            ChannelAttention1d(256, drt_activated=drt_activated),
-            nn.BatchNorm1d(256),
-            nn.ReLU()
-        )
-
-        # Predicts routing coefficients
-        self.routing_net = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, K),
-            nn.Softmax(dim=-1)
-        )
-
-        self.dynamic_layer = DynamicLinear(256, hidden_dim, K=K)
-        self.bn_out = nn.BatchNorm1d(hidden_dim)
-        self.relu_out = nn.ReLU()
+        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated)
+        self.bn2, self.relu2 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
 
     def forward(self, x):
-        h = self.encoder(x)
-        if self.drt_activated:
-            routing_weights = self.routing_net(h)
-        else:
-            # Fallback to standard baseline: Zero out routing weights to disable the dynamic path
-            routing_weights = torch.zeros(x.size(0), self.K, device=x.device)
-
-        h_dyn = self.dynamic_layer(h, routing_weights)
-        return self.relu_out(self.bn_out(h_dyn))
+        h = self.relu1(self.bn1(self.layer1(x)))
+        h = self.relu2(self.bn2(self.layer2(h)))
+        return h
 
 
-class SubspaceRouter(nn.Module):
-    def __init__(self, hidden_dim=128):
-        super().__init__()
-        self.proj1 = nn.Linear(hidden_dim, hidden_dim)
-        self.proj2 = nn.Linear(hidden_dim, hidden_dim)
+# class DynamicBackbone(nn.Module):
+#     def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True):
+#         super().__init__()
+#         self.K = K
+#         self.drt_activated = drt_activated
+#
+#         # Feature extractor with Channel Attention
+#         self.encoder = nn.Sequential(
+#             nn.Linear(in_dim, 256),
+#             ChannelAttention1d(256, drt_activated=drt_activated), # dynamic weight combination before BN ReLu
+#             nn.BatchNorm1d(256),
+#             nn.ReLU(),
+#
+#             nn.Linear(256, 256),
+#             ChannelAttention1d(256, drt_activated=drt_activated),
+#             nn.BatchNorm1d(256),
+#             nn.ReLU()
+#         )
+#
+#         # Predicts routing coefficients
+#         self.routing_net = nn.Sequential(
+#             nn.Linear(256, 64),
+#             nn.ReLU(),
+#             nn.Linear(64, K),
+#             nn.Softmax(dim=-1)
+#         )
+#
+#         self.dynamic_layer = DynamicLinear(256, hidden_dim, K=K)
+#         self.bn_out = nn.BatchNorm1d(hidden_dim)
+#         self.relu_out = nn.ReLU()
+#
+#     def forward(self, x):
+#         h = self.encoder(x)
+#         if self.drt_activated:
+#             routing_weights = self.routing_net(h)
+#         else:
+#             # Fallback to standard baseline: Zero out routing weights to disable the dynamic path
+#             routing_weights = torch.zeros(x.size(0), self.K, device=x.device)
+#
+#         h_dyn = self.dynamic_layer(h, routing_weights)
+#         return self.relu_out(self.bn_out(h_dyn))
 
-    def forward(self, feat):
-        return self.proj1(feat), self.proj2(feat)
+# maybe not realy needed
+# class SubspaceRouter(nn.Module):
+#     def __init__(self, hidden_dim=128):
+#         super().__init__()
+#         self.proj1 = nn.Linear(hidden_dim, hidden_dim)
+#         self.proj2 = nn.Linear(hidden_dim, hidden_dim)
+#
+#     def forward(self, feat):
+#         return self.proj1(feat), self.proj2(feat)
 
 
 class RegressorHead(nn.Module):
@@ -186,9 +223,9 @@ def variance_penalty(pred1, pred2):
 
 
 @torch.no_grad()
-def evaluate(G, Router, F1, F2, loader, device, normalizer):
+def evaluate(G, F1, F2, loader, device, normalizer):
     G.eval()
-    Router.eval()
+    #Router.eval()
     F1.eval()
     F2.eval()
 
@@ -197,9 +234,9 @@ def evaluate(G, Router, F1, F2, loader, device, normalizer):
     for X_b, Y_b in loader:
         X_b, Y_b = X_b.to(device), Y_b.to(device)
         feat = G(X_b)
-        sub1, sub2 = Router(feat)
+        #sub1, sub2 = Router(feat)
         # ensemble: average of the two heads
-        pred = (F1(sub1) + F2(sub2)) / 2.0
+        pred = (F1(feat) + F2(feat)) / 2.0
         preds.append(pred.cpu())
         targets.append(Y_b.cpu())
 
@@ -276,15 +313,13 @@ def train(args):
         drt_activated=args.DRT_activated
     ).to(device)
 
-    Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
+    #Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
     F1 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
     F2 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
 
     opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
-    opt_f = optim.SGD(
-        list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()),
-        lr=args.lr_f, momentum=0.9
-    )
+    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),lr=args.lr_f, momentum=0.9)
+
     scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
     scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
 
@@ -301,7 +336,7 @@ def train(args):
             G.train()
             F1.train()
             F2.train()
-            Router.train()
+            #Router.train()
 
             # Discrepancy warmup factor
             if epoch <= args.warmup_epochs:
@@ -326,13 +361,13 @@ def train(args):
                 # Step A: supervised (and ST)
                 # calculate gradients
                 for p in G.parameters(): p.requires_grad = True
-                for p in list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()):
+                for p in  list(F1.parameters()) + list(F2.parameters()):
                     p.requires_grad = True
 
                 feat_s = G(X_s)
-                sub1_s, sub2_s = Router(feat_s)
-                pred_s1 = F1(sub1_s)
-                pred_s2 = F2(sub2_s)
+                #sub1_s, sub2_s = Router(feat_s)
+                pred_s1 = F1(feat_s)
+                pred_s2 = F2(feat_s)
 
                 loss_s1 = F.mse_loss(pred_s1, Y_s)
                 loss_s2 = F.mse_loss(pred_s2, Y_s)
@@ -345,16 +380,16 @@ def train(args):
                 if args.ST_activated and epoch > args.warmup_epochs: # use st only after warmup to not train on incorrect predictions
                     # eval mode for turn off batch norm and dropout
                     G.eval()
-                    Router.eval()
+                    #Router.eval()
                     F1.eval()
                     F2.eval()
 
                     # dont calculate gradients for pseudo-label generation
                     with torch.no_grad():
                         feat_t_st = G(X_t)
-                        sub1_t_st, sub2_t_st = Router(feat_t_st)
-                        pred_t1_st = F1(sub1_t_st)
-                        pred_t2_st = F2(sub2_t_st)
+                        #sub1_t_st, sub2_t_st = Router(feat_t_st)
+                        pred_t1_st = F1(feat_t_st)
+                        pred_t2_st = F2(feat_t_st)
 
                         # pseudo-label via average
                         pseudo_Y = (pred_t1_st + pred_t2_st) / 2.0
@@ -371,7 +406,7 @@ def train(args):
 
                     # switch back to gradient calculation for training
                     G.train()
-                    Router.train()
+                    #Router.train()
                     F1.train()
                     F2.train()
 
@@ -379,9 +414,9 @@ def train(args):
 
                         # forward pass with gradients on selected target data
                         feat_t_conf = G(X_t[confident_mask])
-                        sub1_t_conf, sub2_t_conf = Router(feat_t_conf)
-                        pred_t1_conf = F1(sub1_t_conf)
-                        pred_t2_conf = F2(sub2_t_conf)
+                        #sub1_t_conf, sub2_t_conf = Router(feat_t_conf)
+                        pred_t1_conf = F1(feat_t_conf)
+                        pred_t2_conf = F2(feat_t_conf)
 
                         loss_st = 0.5 * (
                                 F.mse_loss(pred_t1_conf, pseudo_Y[confident_mask]) +
@@ -400,19 +435,19 @@ def train(args):
                     # Step B: Train Router / Heads (Maximize Target Discrepancy)
                     # Freeze backbone G
                     for p in G.parameters(): p.requires_grad = False
-                    for p in list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()):
+                    for p in list(F1.parameters()) + list(F2.parameters()):
                         p.requires_grad = True
 
                     feat_s = G(X_s).detach()
                     feat_t = G(X_t).detach()
 
-                    sub1_s, sub2_s = Router(feat_s)
-                    sub1_t, sub2_t = Router(feat_t)
+                    #sub1_s, sub2_s = Router(feat_s)
+                    #sub1_t, sub2_t = Router(feat_t)
 
-                    pred_s1 = F1(sub1_s)
-                    pred_s2 = F2(sub2_s)
-                    pred_t1 = F1(sub1_t)
-                    pred_t2 = F2(sub2_t)
+                    pred_s1 = F1(feat_s)
+                    pred_s2 = F2(feat_s)
+                    pred_t1 = F1(feat_t)
+                    pred_t2 = F2(feat_t)
 
                     loss_s1 = F.mse_loss(pred_s1, Y_s)
                     loss_s2 = F.mse_loss(pred_s2, Y_s)
@@ -429,13 +464,13 @@ def train(args):
                     # Step C: Train Backbone G (Minimize Target Discrepancy)
                     # Freeze Router and Heads
                     for p in G.parameters(): p.requires_grad = True
-                    for p in list(Router.parameters()) + list(F1.parameters()) + list(F2.parameters()):
+                    for p in list(F1.parameters()) + list(F2.parameters()):
                         p.requires_grad = False
 
                     feat_t = G(X_t)
-                    sub1_t, sub2_t = Router(feat_t)
-                    pred_t1 = F1(sub1_t)
-                    pred_t2 = F2(sub2_t)
+                    #sub1_t, sub2_t = Router(feat_t)
+                    pred_t1 = F1(feat_t)
+                    pred_t2 = F2(feat_t)
 
                     dis = discrepancy_loss(pred_t1, pred_t2)
                     vpen = variance_penalty(pred_t1, pred_t2)
@@ -460,7 +495,7 @@ def train(args):
                   f"MSE1={stats['mse1'] / n:.4f}  MSE2={stats['mse2'] / n:.4f}  "
                   )
 
-            mae, rmse, r2, corr = evaluate(G, Router, F1, F2, val_loader, device, normalizer)
+            mae, rmse, r2, corr = evaluate(G, F1, F2, val_loader, device, normalizer)
             print(f"  MAE={mae:.4f}  RMSE={rmse:.4f}  R²={r2:.4f} Corr.={corr:.4f}" )
 
             mlflow.log_metrics(
@@ -516,8 +551,6 @@ if __name__ == "__main__":
 
     allowed_values = [
         (False, False, False),
-        (False, True, False),
-        (False, True, True),
         (True, False, False),
         (True, True, False),
         (True, True, True)
