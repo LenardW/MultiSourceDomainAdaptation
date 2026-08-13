@@ -1,4 +1,5 @@
 import csv
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,6 +10,15 @@ import argparse
 import os
 from scipy.stats import pearsonr
 import mlflow
+
+def set_seed(seed):
+    """
+    set seed for every rng
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def load_csv(path):
 
@@ -91,7 +101,7 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
 #         # can also try out = x * 2 * torch.sigmoid(weights) for [0,2]
 
 class DynamicLinear(nn.Module):
-    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True):
+    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16):
         super().__init__()
         self.K = K
         self.drt_activated = drt_activated
@@ -108,7 +118,8 @@ class DynamicLinear(nn.Module):
 
         # ONE shared lightweight branch feeds both Λ(x) and π(x),
         # mirroring the single attention branch in the paper's Fig. 3
-        hidden = max(in_dim // reduction, 4) # need explanation for that, why use for both
+        #hidden = max(in_dim // reduction, 4)
+        hidden = min(max(in_dim // reduction, min_hidden), in_dim) # first layer get 14 second gets 16
         self.branch = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
         self.to_lambda = nn.Linear(hidden, out_dim)   # -> sigmoid, Λ(x)
         self.to_pi     = nn.Linear(hidden, K)          # -> softmax, π(x)
@@ -258,11 +269,7 @@ def evaluate(G, F1, F2, loader, device, normalizer):
     return mae, rmse, r2, correlation
 
 def train(args):
-
-    #mlflow loging
-    mlflow.set_experiment("DRT_multisource")
-    mlflow.config.enable_system_metrics_logging()
-    mlflow.config.set_system_metrics_sampling_interval(1)
+    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -326,9 +333,12 @@ def train(args):
     # We only need to iterate through target batches if MCD or ST is active
     use_target = args.MCD_activated or args.ST_activated
 
-    with mlflow.start_run() as run:
-        mlflow.log_params(vars(args))
+    run_name = (f"{args.target_x_dict.replace('X_', '').replace('.csv', '')}"
+                f"_seed{args.seed}")
 
+    with mlflow.start_run(run_name=run_name, nested=True):
+        mlflow.log_params({k: (str(v) if isinstance(v, (list, tuple)) else v)
+                           for k, v in vars(args).items()})
         if use_target:
             trg_iter = iter(trg_loader)
 
@@ -430,6 +440,10 @@ def train(args):
                 opt_g.step()
                 opt_f.step()
 
+                stats["mse1"] += loss_s1.item() * bsz
+                stats["mse2"] += loss_s2.item() * bsz
+                stats["n"] += bsz
+
                 # Step B and C only for MCD
                 if args.MCD_activated:
                     # Step B: Train Router / Heads (Maximize Target Discrepancy)
@@ -482,10 +496,6 @@ def train(args):
                     loss_stepC.backward()
                     opt_g.step()  # Only update Backbone G
 
-                # Record statistics
-                stats["mse1"] += loss_s1.item() * bsz
-                stats["mse2"] += loss_s2.item() * bsz
-                stats["n"] += bsz
 
             scheduler_g.step()
             scheduler_f.step()
@@ -536,8 +546,12 @@ def parse_args():
 
     return p.parse_args()
 
-if __name__ == "__main__":
+def main():
+
     args = parse_args()
+
+    mlflow.set_experiment("DRT_multisource")
+
 
     seeds = [100,200,74,15,984]
 
@@ -551,6 +565,7 @@ if __name__ == "__main__":
 
     allowed_values = [
         (False, False, False),
+        (False, True, False),
         (True, False, False),
         (True, True, False),
         (True, True, True)
@@ -568,39 +583,47 @@ if __name__ == "__main__":
         all_target_r2_means = []
         all_target_corr_means = []
 
-        for target_x, target_y in animal_pool:
+        with mlflow.start_run(run_name=f"mcd_{int(args.MCD_activated)}"
+                                       f"_drt{int(args.DRT_activated)}"
+                                       f"_st{int(args.ST_activated)}"):
+            mlflow.log_params({"config_idx": idx, **config})
 
-            target_name = target_x.replace("X_", "").replace(".csv", "")
+            for target_x, target_y in animal_pool:
 
-            sources = [pair for pair in animal_pool if pair != (target_x, target_y)]
+                target_name = target_x.replace("X_", "").replace(".csv", "")
 
-            sources_x_str = ",".join([pair[0] for pair in sources])
-            sources_y_str = ",".join([pair[1] for pair in sources])
+                sources = [pair for pair in animal_pool if pair != (target_x, target_y)]
 
-            args.target_x_dict = target_x
-            args.target_y_dict = target_y
-            args.source_x_dicts = sources_x_str
-            args.source_y_dicts = sources_y_str
+                sources_x_str = ",".join([pair[0] for pair in sources])
+                sources_y_str = ",".join([pair[1] for pair in sources])
 
-            seed_r2 = []
-            seed_corr = []
+                args.target_x_dict = target_x
+                args.target_y_dict = target_y
+                args.source_x_dicts = sources_x_str
+                args.source_y_dicts = sources_y_str
 
-            for i in range(len(seeds)):
-                args.seed = seeds[i]
-                run_r2, run_corr = train(args)
-                seed_r2.append(run_r2)
-                seed_corr.append(run_corr)
+                seed_r2 = []
+                seed_corr = []
 
-            mean_r2 = np.mean(seed_r2)
-            std_r2 = np.std(seed_r2, ddof=1) # sample std
+                for i in range(len(seeds)):
+                    args.seed = seeds[i]
+                    run_r2, run_corr = train(args)
+                    seed_r2.append(run_r2)
+                    seed_corr.append(run_corr)
 
-            mean_corr =  np.mean(seed_corr)
-            std_corr = np.std(seed_corr, ddof=1)
+                mean_r2 = np.mean(seed_r2)
+                std_r2 = np.std(seed_r2, ddof=1) # sample std
 
-            final_summary[target_name] = (mean_r2, std_r2, mean_corr, std_corr)
-            all_target_r2_means.append(mean_r2)
-            all_target_corr_means.append(mean_corr)
-            print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
+                mean_corr =  np.mean(seed_corr)
+                std_corr = np.std(seed_corr, ddof=1)
+
+                final_summary[target_name] = (mean_r2, std_r2, mean_corr, std_corr)
+                all_target_r2_means.append(mean_r2)
+                all_target_corr_means.append(mean_corr)
+                print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
+
+            mlflow.log_metrics({"mean_R²": float(np.mean(all_target_r2_means)),
+                                "mean_Corr": float(np.mean(all_target_corr_means))})
 
         output_file = "drt_training_results.txt"
 
@@ -625,5 +648,5 @@ if __name__ == "__main__":
             print(footer, end="")
             f.write(footer)
 
-
-
+if __name__ == "__main__":
+    main()
