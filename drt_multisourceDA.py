@@ -260,7 +260,7 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
             da_weight = min(1.0, (gstep - args.warmup_epochs) / 20.0)
 
         stats = {"mse1": 0.0, "mse2": 0.0, "st": 0.0, "dis": 0.0,
-                 "vpen": 0.0, "n": 0, "nb": 0}
+                 "dis_s": 0.0, "vpen": 0.0, "n": 0, "nb": 0}
 
         for X_s, Y_s in src_loader:
             bsz = X_s.size(0)
@@ -480,7 +480,8 @@ def train(args):
 
             mlflow.log_metrics({"st_keep_rate": keep_rate,
                                 "st_threshold": thr,
-                                "st_n_pseudo": float(len(Xp))})
+                                "st_n_pseudo": float(len(Xp))},
+                               step=args.epochs)
             print(f"  [ST] kept {keep_rate:.1%} of target samples "
                   f"({len(Xp)} pseudo-labelled, thr={thr:.4f})")
 
@@ -524,10 +525,10 @@ def train(args):
                 path, ents, sims = res
                 mlflow.log_artifact(path)
                 for i, e in enumerate(ents):
-                    mlflow.log_metric(f"pi_entropy_l{i + 1}", e)
+                    mlflow.log_metric(f"final_pi_entropy_l{i + 1}", e)
                 for i, s in enumerate(sims):
                     if s is not None:
-                        mlflow.log_metric(f"basis_sim_l{i + 1}", s)
+                        mlflow.log_metric(f"final_basis_sim_l{i + 1}", s)
                 print(f"  [pi] entropy={['%.3f' % e for e in ents]} "
                       f"basis_sim={['%.3f' % s for s in sims]} -> {path}")
 
