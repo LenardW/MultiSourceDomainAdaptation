@@ -10,6 +10,7 @@ import argparse
 import os
 from scipy.stats import pearsonr
 import mlflow
+from drt_pi import dump_pi
 
 def set_seed(seed):
     """
@@ -78,6 +79,7 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
 class DynamicLinear(nn.Module):
     def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16):
         super().__init__()
+        self.last_pi = None
         self.K = K
         self.drt_activated = drt_activated
 
@@ -94,18 +96,20 @@ class DynamicLinear(nn.Module):
         # ONE shared lightweight branch feeds both Λ(x) and π(x),
         # mirroring the single attention branch in the paper's Fig. 3
         #hidden = max(in_dim // reduction, 4)
-        hidden = min(max(in_dim // reduction, min_hidden), in_dim) # first layer get 14 second gets 16
+        hidden = min(max(in_dim // reduction, min_hidden), in_dim) # first layer get 14, second gets 16
         self.branch = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
         self.to_lambda = nn.Linear(hidden, out_dim)   # -> sigmoid, Λ(x)
         self.to_pi     = nn.Linear(hidden, K)          # -> softmax, π(x)
 
     def forward(self, x):
         if not self.drt_activated:
+            self.last_pi = None
             return F.linear(x, self.static_weight, self.static_bias)
 
         h = self.branch(x)
         lam = torch.sigmoid(self.to_lambda(h))           # [B, out_dim]
         pi  = torch.softmax(self.to_pi(h), dim=-1)        # [B, K]
+        self.last_pi = pi.detach()
 
         lam_term = lam.unsqueeze(-1) * self.static_weight.unsqueeze(0)     # Λ(x)W_0, per sample
         pi_term  = torch.einsum('bk,kij->bij', pi, self.residual_weights)  # Σπ_i(x)Φ_i
@@ -189,14 +193,21 @@ def evaluate(G, F1, F2, loader, device, normalizer):
     return mae, rmse, r2, correlation
 
 @torch.no_grad()
+def basis_similarity(layer):
+    """Mean pairwise |cosine| between the K basis matrices Phi_i.
+
+    Nothing in DRT's loss encourages the Phi_i to differ. If they converge,
+    sum_i pi_i Phi_i is constant in pi and routing silently degrades to a
+    static layer with K times the parameters. Values near 1 mean collapse.
+    """
+    W = F.normalize(layer.residual_weights.flatten(1), dim=1)   # [K, out*in]
+    sim = (W @ W.t()).abs()
+    off = sim[~torch.eye(layer.K, dtype=torch.bool, device=sim.device)]
+    return float(off.mean())
+
+@torch.no_grad()
 def make_pseudo_labels(G, F1, F2, X_trg, device, keep_quantile):
-    """Label the target training split once, using the converged model.
-
-    Regression has no softmax confidence, so head agreement stands in -- it is
-    also the quantity MCD optimises. The threshold is a quantile of the observed
-    disagreement rather than an absolute value, so the keep rate is comparable
-    across animals and seeds instead of drifting with how converged the run is.
-
+    """
     One-shot pseudo-labelling of the unlabelled target split.
 
     The paper runs self-training as a *second training round* after DRT has
@@ -317,6 +328,8 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
                 dis = discrepancy_loss(pred_t1, pred_t2)
                 vpen = variance_penalty(pred_t1, pred_t2)
 
+                stats["dis_s"] += float(discrepancy_loss(pred_s1, pred_s2).detach())
+
                 # Minimising a negative 'dis' term maximises the discrepancy
                 loss_stepB = (F.mse_loss(pred_s1, Y_s)
                               + F.mse_loss(pred_s2, Y_s)
@@ -365,10 +378,17 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
             "lr_f": opt_f.param_groups[0]["lr"],
         }
         if args.MCD_activated:
+            log["discrepancy_src"] = stats["dis_s"] / nb
             log["discrepancy_trg"] = stats["dis"] / nb
             log["variance_penalty"] = stats["vpen"] / nb
         if pseudo_iter is not None:
             log["mse_pseudo"] = stats["st"] / n
+        if args.DRT_activated:
+            for i, layer in enumerate([G.layer1, G.layer2], start=1):
+                log[f"basis_sim_l{i}"] = basis_similarity(layer)
+                log[f"basis_norm_l{i}"] = float(
+                    layer.residual_weights.norm() /
+                    (layer.static_weight.norm() + 1e-8))
         mlflow.log_metrics(log, step=gstep)
 
         print(f"  ep {gstep:03d} da={da_weight:.2f} "
@@ -398,11 +418,11 @@ def train(args):
         X_s, Y_s = load_data(source_x_path, source_y_path)
         source_domains.append((X_s, Y_s))
 
-    # concat -- no domain labels anywhere, the sources are pooled
+    # concat pooled source
     X_src_all = np.concatenate([X for X, Y in source_domains], axis=0)
     Y_src_all = np.concatenate([Y for X, Y in source_domains], axis=0)
 
-    # normalize on source only; target statistics would leak
+    # normalize on source only
     normalizer = Normalizer().fit(X_src_all, Y_src_all)
 
     X_src_n = normalizer.transform_X(X_src_all)
@@ -415,8 +435,7 @@ def train(args):
     (trg_train_X, trg_train_Y), (trg_val_X, trg_val_Y) = split_domain(
         target_X_n, target_Y_n, val_ratio=0.2, seed=args.seed)
 
-    # Dataloader. trg_train_Y is never used in a loss -- the target training
-    # split is unlabelled as far as the method is concerned.
+    # Dataloader trg_train_Y not used
     src_loader = make_loader(X_src_n, Y_src_n, args.batch_size)
     trg_loader = make_loader(trg_train_X, trg_train_Y, args.batch_size)
     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
@@ -425,7 +444,7 @@ def train(args):
     G = DynamicBackbone(
         in_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
-        K=4,
+        K= args.K,
         drt_activated=args.DRT_activated
     ).to(device)
 
@@ -449,12 +468,12 @@ def train(args):
                            for k, v in vars(args).items()})
         mlflow.log_param("n_params_G", sum(p.numel() for p in G.parameters()))
 
-        # ---- Phase 1 ----
+        #Phase 1
         metrics = run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f,
                             src_loader, trg_loader, val_loader, normalizer,
                             device, args, args.epochs, 0, phase=0)
 
-        # ---- Phase 2: self-training, a second round as in the paper ----
+        #Phase 2: self-training
         if args.ST_activated:
             Xp, Yp, keep_rate, thr = make_pseudo_labels(
                 G, F1, F2, trg_train_X, device, args.st_keep_quantile)
@@ -471,9 +490,9 @@ def train(args):
                 # Lower learning rate for the refinement round, and a fresh
                 # scheduler with no milestones so it stays constant.
                 for g in opt_g.param_groups:
-                    g["lr"] *= args.st_lr_scale
+                    g["lr"] = args.lr * args.st_lr_scale
                 for g in opt_f.param_groups:
-                    g["lr"] *= args.st_lr_scale
+                    g["lr"] = args.lr_f * args.st_lr_scale
                 sch_g = optim.lr_scheduler.MultiStepLR(opt_g, [], gamma=0.1)
                 sch_f = optim.lr_scheduler.MultiStepLR(opt_f, [], gamma=0.1)
 
@@ -486,230 +505,62 @@ def train(args):
                 print(f"  [ST] skipped: only {len(Xp)} samples kept, "
                       f"need > {args.batch_size}")
 
+        #dump Pi
+        if args.pi_dump_dir and args.DRT_activated:
+            names = [args.target_x_dict] + args.source_x_dicts.split(",")
+            names = [n.replace("X_", "").replace(".csv", "") for n in names]
+            domains = [(trg_val_X, normalizer.inverse_Y(trg_val_Y))]
+            domains += [(normalizer.transform_X(Xs), Ys)
+                        for Xs, Ys in source_domains]
+
+            res = dump_pi(
+                G, lambda X, Y: make_loader(X, Y, 512, shuffle=False,
+                                            drop_last=False),
+                domains, names, device, args.pi_dump_dir, K=args.K,
+                target_name=names[0], tag_extra=f"_seed{args.seed}",
+                max_per_domain=args.pi_max_per_domain, seed=args.seed)
+
+            if res is not None:
+                path, ents, sims = res
+                mlflow.log_artifact(path)
+                for i, e in enumerate(ents):
+                    mlflow.log_metric(f"pi_entropy_l{i + 1}", e)
+                for i, s in enumerate(sims):
+                    if s is not None:
+                        mlflow.log_metric(f"basis_sim_l{i + 1}", s)
+                print(f"  [pi] entropy={['%.3f' % e for e in ents]} "
+                      f"basis_sim={['%.3f' % s for s in sims]} -> {path}")
+
     mae, rmse, r2, corr = metrics
     return r2, corr
 
-# def train(args):
-#     set_seed(args.seed)
-#
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#
-#     # load target domain and labels
-#     target_x_path = os.path.join(args.data_dict_path, args.target_x_dict)
-#     target_y_path = os.path.join(args.data_dict_path, args.target_y_dict)
-#     target_X, target_Y = load_data(target_x_path, target_y_path)
-#
-#     # load source domains
-#     source_domains = []
-#     x_src_dicts = args.source_x_dicts.split(",")
-#     y_src_dicts = args.source_y_dicts.split(",")
-#
-#     for i in range(len(x_src_dicts)):
-#         source_x_path = os.path.join(args.data_dict_path, x_src_dicts[i])
-#         source_y_path = os.path.join(args.data_dict_path, y_src_dicts[i])
-#         X_s, Y_s = load_data(source_x_path, source_y_path)
-#         source_domains.append((X_s, Y_s))
-#
-#     #concat
-#     X_src_all = np.concatenate([X for X, Y in source_domains], axis=0)
-#     Y_src_all = np.concatenate([Y for X, Y in source_domains], axis=0)
-#
-#     #normalize
-#     normalizer = Normalizer().fit(X_src_all, Y_src_all)
-#
-#     X_src_n = normalizer.transform_X(X_src_all)
-#     Y_src_n = normalizer.transform_Y(Y_src_all)
-#
-#     target_X_n = normalizer.transform_X(target_X)
-#     target_Y_n = normalizer.transform_Y(target_Y)
-#
-#     #split in train/eval
-#     (trg_train_X, trg_train_Y), (trg_val_X, trg_val_Y) = split_domain(
-#             target_X_n, target_Y_n, val_ratio=0.2, seed = args.seed)
-#
-#     #Dataloader
-#
-#     src_loader = make_loader(X_src_n, Y_src_n, args.batch_size)
-#     trg_loader = make_loader(trg_train_X, trg_train_Y, args.batch_size)
-#     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
-#                              shuffle=False, drop_last=False)
-#
-#     G = DynamicBackbone(
-#         in_dim=args.input_dim,
-#         hidden_dim=args.hidden_dim,
-#         K=4,
-#         drt_activated=args.DRT_activated
-#     ).to(device)
-#
-#     #Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
-#     F1 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
-#     F2 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
-#
-#     opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
-#     opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),lr=args.lr_f, momentum=0.9)
-#
-#     scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
-#     scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
-#
-#     # We only need to iterate through target batches if MCD or ST is active
-#     use_target = args.MCD_activated or args.ST_activated
-#
-#     run_name = (f"{args.target_x_dict.replace('X_', '').replace('.csv', '')}"
-#                 f"_seed{args.seed}")
-#
-#     with mlflow.start_run(run_name=run_name, nested=True):
-#         mlflow.log_params({k: (str(v) if isinstance(v, (list, tuple)) else v)
-#                            for k, v in vars(args).items()})
-#         if use_target:
-#             trg_iter = iter(trg_loader)
-#
-#         for epoch in range(1, args.epochs + 1):
-#             G.train()
-#             F1.train()
-#             F2.train()
-#             #Router.train()
-#
-#             # Discrepancy warmup factor
-#             if epoch <= args.warmup_epochs:
-#                 da_weight = 0.0
-#             else:
-#                 da_weight = min(1.0, (epoch - args.warmup_epochs) / 20.0)
-#
-#             stats = {"mse1": 0.0, "mse2": 0.0, "n": 0}
-#
-#             for X_s, Y_s in src_loader:
-#                 bsz = X_s.size(0)
-#                 X_s, Y_s = X_s.to(device), Y_s.to(device)
-#
-#                 if use_target:
-#                     try:
-#                         X_t, _ = next(trg_iter)
-#                     except StopIteration:
-#                         trg_iter = iter(trg_loader)
-#                         X_t, _ = next(trg_iter)
-#                     X_t = X_t.to(device)
-#
-#                 # Step A: supervised (and ST)
-#                 # calculate gradients
-#                 for p in G.parameters(): p.requires_grad = True
-#                 for p in  list(F1.parameters()) + list(F2.parameters()):
-#                     p.requires_grad = True
-#
-#                 feat_s = G(X_s)
-#                 #sub1_s, sub2_s = Router(feat_s)
-#                 pred_s1 = F1(feat_s)
-#                 pred_s2 = F2(feat_s)
-#
-#                 loss_s1 = F.mse_loss(pred_s1, Y_s)
-#                 loss_s2 = F.mse_loss(pred_s2, Y_s)
-#                 loss_stepA = loss_s1 + loss_s2
-#
-#                 opt_g.zero_grad()
-#                 opt_f.zero_grad()
-#                 loss_stepA.backward()
-#                 opt_g.step()
-#                 opt_f.step()
-#
-#                 stats["mse1"] += loss_s1.item() * bsz
-#                 stats["mse2"] += loss_s2.item() * bsz
-#                 stats["n"] += bsz
-#
-#                 # Step B and C only for MCD
-#                 if args.MCD_activated:
-#                     # Step B: Train Router / Heads (Maximize Target Discrepancy)
-#                     # Freeze backbone G
-#                     for p in G.parameters(): p.requires_grad = False
-#                     for p in list(F1.parameters()) + list(F2.parameters()):
-#                         p.requires_grad = True
-#
-#                     feat_s = G(X_s).detach()
-#                     feat_t = G(X_t).detach()
-#
-#                     #sub1_s, sub2_s = Router(feat_s)
-#                     #sub1_t, sub2_t = Router(feat_t)
-#
-#                     pred_s1 = F1(feat_s)
-#                     pred_s2 = F2(feat_s)
-#                     pred_t1 = F1(feat_t)
-#                     pred_t2 = F2(feat_t)
-#
-#                     loss_s1 = F.mse_loss(pred_s1, Y_s)
-#                     loss_s2 = F.mse_loss(pred_s2, Y_s)
-#                     dis = discrepancy_loss(pred_t1, pred_t2)
-#                     vpen = variance_penalty(pred_t1, pred_t2)
-#
-#                     # Minimizing a negative 'dis' term maximizes the discrepancy boundary
-#                     loss_stepB = (loss_s1 + loss_s2) + da_weight * (args.gamma * vpen - args.eta * dis)
-#
-#                     opt_f.zero_grad()
-#                     loss_stepB.backward()
-#                     opt_f.step()  # only update Router/ Heads
-#
-#                     # Step C: Train Backbone G (Minimize Target Discrepancy)
-#                     # Freeze Router and Heads
-#                     for p in G.parameters(): p.requires_grad = True
-#                     for p in list(F1.parameters()) + list(F2.parameters()):
-#                         p.requires_grad = False
-#
-#                     feat_t = G(X_t)
-#                     #sub1_t, sub2_t = Router(feat_t)
-#                     pred_t1 = F1(feat_t)
-#                     pred_t2 = F2(feat_t)
-#
-#                     dis = discrepancy_loss(pred_t1, pred_t2)
-#                     vpen = variance_penalty(pred_t1, pred_t2)
-#
-#                     # Minimizing positive 'dis' aligns target domain inside the boundaries
-#                     loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
-#
-#                     opt_g.zero_grad()
-#                     loss_stepC.backward()
-#                     opt_g.step()  # Only update Backbone G
-#
-#
-#             scheduler_g.step()
-#             scheduler_f.step()
-#
-#             n = stats["n"]
-#             print(f"Epoch {epoch:03d}/{args.epochs} " #DA:{da_str}  "
-#                   f"MSE1={stats['mse1'] / n:.4f}  MSE2={stats['mse2'] / n:.4f}  "
-#                   )
-#
-#             mae, rmse, r2, corr = evaluate(G, F1, F2, val_loader, device, normalizer)
-#             print(f"  MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f} Corr.={corr:.4f}" )
-#
-#             mlflow.log_metrics(
-#                 {
-#                     "MSE1": stats['mse1']/n,
-#                     "MSE2": stats['mse2']/n,
-#                     "MAE": mae,
-#                     "RMSE": rmse,
-#                     "R2": r2,
-#                     "Corr.": corr,
-#                 },
-#                 step=epoch,
-#             )
-#     return r2, corr
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="DRT")
+
+    # paths
     p.add_argument("--data_dict_path", type=str, default="C:/Users/leona/PythonScripts/MasterThesis/Tierdaten/")
     p.add_argument("--target_x_dict", type=str, default="X_anim1.csv")
     p.add_argument("--target_y_dict", type=str, default="Y_anim1.csv")
     p.add_argument("--source_x_dicts", type=str, default="X_anim10.csv,X_anim3.csv,X_anim4.csv,X_anim8.csv")
     p.add_argument("--source_y_dicts", type=str, default="Y_anim10.csv,Y_anim3.csv,Y_anim4.csv,Y_anim8.csv")
+
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=100, help="Epochs of source-only training")
+    p.add_argument("--warmup_epochs", type=int, default=60, help="source-only training")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
-    p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
-    p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
+
     p.add_argument("--input_dim", type=int, default=14)
     p.add_argument("--hidden_dim", type=int, default=128)
-    p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
+    p.add_argument("--schedule", type=int, nargs="+", default=[100, 125, 140])
     p.add_argument("--seed", type=int, default=100)
+
+    # DRT
+    p.add_argument("--K", type=int, default=4)
+
+    #MCD
+    p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
+    p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
 
     # switches
     p.add_argument("--MCD_activated", type=bool, default=False, help="If False source only")
@@ -722,7 +573,9 @@ def parse_args():
     p.add_argument("--st_weight", type=float, default=1.0)
     p.add_argument("--st_lr_scale", type=float, default=0.1)
 
-
+    # pi
+    p.add_argument("--pi_dump_dir", type=str, default="pi_dumps")
+    p.add_argument("--pi_max_per_domain", type=int, default=2000)
 
     return p.parse_args()
 
@@ -748,7 +601,7 @@ def main():
         (False, True, False),
         (True, False, False),
         (True, True, False),
-        # (True, True, True)
+        (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
