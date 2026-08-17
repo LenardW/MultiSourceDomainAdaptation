@@ -18,7 +18,6 @@ def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 def load_csv(path):
 
@@ -75,30 +74,6 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
     ds  = TensorDataset(X_t, Y_t)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       drop_last=drop_last)
-
-# class ChannelAttention1d(nn.Module):
-#     def __init__(self, dim, reduction=16, drt_activated=True):
-#         super().__init__()
-#         self.drt_activated = drt_activated
-#         # We don't have the Squeeze step here from Squeeze-and-Excitation paper (Hu et al.)
-#         # since we don't have spatial feature maps like in CNNs to summarize
-#         self.fc = nn.Sequential(
-#             nn.Linear(dim, dim // reduction, bias=False), # FC 256 -> 16
-#             nn.ReLU(),
-#             # forced through a bottleneck to learn relationships
-#             nn.Linear(dim // reduction, dim, bias=False), # FC 16 -> 256
-#             nn.Sigmoid()    # output [0,1]
-#         )
-#
-#     def forward(self, x):
-#         if not self.drt_activated:
-#             return x # static transfer: if not activated, nothing happens
-#         attention_weights = self.fc(x)
-#         # update: W(x) = W_0 + Λ(x) W_0 like in the DRT paper
-#         return x + x * attention_weights # not x * attention_weights like in Squeeze-and-Excitation paper (Hu et al.)
-#         # that could be a point to test if channel suppression or boosting works better
-#         # also called residual gating
-#         # can also try out = x * 2 * torch.sigmoid(weights) for [0,2]
 
 class DynamicLinear(nn.Module):
     def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16):
@@ -159,60 +134,6 @@ class DynamicBackbone(nn.Module):
         h = self.relu2(self.bn2(self.layer2(h)))
         return h
 
-
-# class DynamicBackbone(nn.Module):
-#     def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True):
-#         super().__init__()
-#         self.K = K
-#         self.drt_activated = drt_activated
-#
-#         # Feature extractor with Channel Attention
-#         self.encoder = nn.Sequential(
-#             nn.Linear(in_dim, 256),
-#             ChannelAttention1d(256, drt_activated=drt_activated), # dynamic weight combination before BN ReLu
-#             nn.BatchNorm1d(256),
-#             nn.ReLU(),
-#
-#             nn.Linear(256, 256),
-#             ChannelAttention1d(256, drt_activated=drt_activated),
-#             nn.BatchNorm1d(256),
-#             nn.ReLU()
-#         )
-#
-#         # Predicts routing coefficients
-#         self.routing_net = nn.Sequential(
-#             nn.Linear(256, 64),
-#             nn.ReLU(),
-#             nn.Linear(64, K),
-#             nn.Softmax(dim=-1)
-#         )
-#
-#         self.dynamic_layer = DynamicLinear(256, hidden_dim, K=K)
-#         self.bn_out = nn.BatchNorm1d(hidden_dim)
-#         self.relu_out = nn.ReLU()
-#
-#     def forward(self, x):
-#         h = self.encoder(x)
-#         if self.drt_activated:
-#             routing_weights = self.routing_net(h)
-#         else:
-#             # Fallback to standard baseline: Zero out routing weights to disable the dynamic path
-#             routing_weights = torch.zeros(x.size(0), self.K, device=x.device)
-#
-#         h_dyn = self.dynamic_layer(h, routing_weights)
-#         return self.relu_out(self.bn_out(h_dyn))
-
-# maybe not realy needed
-# class SubspaceRouter(nn.Module):
-#     def __init__(self, hidden_dim=128):
-#         super().__init__()
-#         self.proj1 = nn.Linear(hidden_dim, hidden_dim)
-#         self.proj2 = nn.Linear(hidden_dim, hidden_dim)
-#
-#     def forward(self, feat):
-#         return self.proj1(feat), self.proj2(feat)
-
-
 class RegressorHead(nn.Module):
     def __init__(self, hidden_dim=128):
         super().__init__()
@@ -230,7 +151,6 @@ def discrepancy_loss(pred1, pred2):
 
 def variance_penalty(pred1, pred2):
     return -(torch.var(pred1) + torch.var(pred2))
-
 
 
 @torch.no_grad()
@@ -260,13 +180,202 @@ def evaluate(G, F1, F2, loader, device, normalizer):
 
     mae  = np.mean(np.abs(preds_orig - targets_orig))
     rmse = np.sqrt(np.mean((preds_orig - targets_orig) ** 2))
-    # R² on original scale
+    # R2 on original scale
     ss_res = np.sum((targets_orig - preds_orig) ** 2)
     ss_tot = np.sum((targets_orig - targets_orig.mean()) ** 2)
     r2 = 1 - ss_res / (ss_tot + 1e-8)
 
     correlation, _ = pearsonr(targets, preds)
     return mae, rmse, r2, correlation
+
+@torch.no_grad()
+def make_pseudo_labels(G, F1, F2, X_trg, device, keep_quantile):
+    """Label the target training split once, using the converged model.
+
+    Regression has no softmax confidence, so head agreement stands in -- it is
+    also the quantity MCD optimises. The threshold is a quantile of the observed
+    disagreement rather than an absolute value, so the keep rate is comparable
+    across animals and seeds instead of drifting with how converged the run is.
+
+    One-shot pseudo-labelling of the unlabelled target split.
+
+    The paper runs self-training as a *second training round* after DRT has
+    converged, not as an online per-batch step: pseudo-labels above a
+    confidence threshold are used to train DRT again together with source
+    samples. Regression has no softmax confidence, so head agreement stands in
+    for it -- which is also the quantity MCD already optimises, making it the
+    natural confidence proxy here.
+
+    The threshold is a quantile of the observed discrepancy rather than an
+    absolute number, so the keep rate is stable across animals and scales.
+    """
+    G.eval(); F1.eval(); F2.eval()
+    Xt = torch.tensor(X_trg, dtype=torch.float32).to(device)
+
+    p1s, p2s = [], []
+    for i in range(0, len(Xt), 512):
+        feat = G(Xt[i:i + 512])
+        p1s.append(F1(feat)); p2s.append(F2(feat))
+    p1, p2 = torch.cat(p1s), torch.cat(p2s)
+
+    pseudo = ((p1 + p2) / 2.0).cpu().numpy()
+    disc = torch.abs(p1 - p2).cpu().numpy()
+    thr = float(np.quantile(disc, keep_quantile))
+    keep = disc <= thr
+    return X_trg[keep], pseudo[keep], float(keep.mean()), thr
+
+def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
+              val_loader, normalizer, device, args, n_epochs, epoch_offset,
+              phase, pseudo_loader=None):
+    """One training phase.
+
+    Metric names are identical in both phases and the epoch counter continues
+    across them, so every MLflow curve is continuous over the whole run; the
+    `phase` metric marks where the self-training round starts.
+    """
+    metrics = None
+    trg_iter = iter(trg_loader) if args.MCD_activated else None
+    pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
+    head_params = list(F1.parameters()) + list(F2.parameters())
+
+    for epoch in range(1, n_epochs + 1):
+        gstep = epoch_offset + epoch
+        G.train(); F1.train(); F2.train()
+
+        # Discrepancy warmup factor
+        if gstep <= args.warmup_epochs:
+            da_weight = 0.0
+        else:
+            da_weight = min(1.0, (gstep - args.warmup_epochs) / 20.0)
+
+        stats = {"mse1": 0.0, "mse2": 0.0, "st": 0.0, "dis": 0.0,
+                 "vpen": 0.0, "n": 0, "nb": 0}
+
+        for X_s, Y_s in src_loader:
+            bsz = X_s.size(0)
+            X_s, Y_s = X_s.to(device), Y_s.to(device)
+
+            if args.MCD_activated:
+                try:
+                    X_t, _ = next(trg_iter)
+                except StopIteration:
+                    trg_iter = iter(trg_loader)
+                    X_t, _ = next(trg_iter)
+                X_t = X_t.to(device)
+
+            # ---- Step A: supervised risk, plus pseudo-labelled target ----
+            for p in G.parameters():
+                p.requires_grad = True
+            for p in head_params:
+                p.requires_grad = True
+
+            feat_s = G(X_s)
+            loss_s1 = F.mse_loss(F1(feat_s), Y_s)
+            loss_s2 = F.mse_loss(F2(feat_s), Y_s)
+            loss_stepA = loss_s1 + loss_s2
+
+            # Pseudo-labelled target samples join the source loss, as the paper
+            # describes: "used to train DRT again with source samples".
+            if pseudo_iter is not None:
+                try:
+                    Xp, Yp = next(pseudo_iter)
+                except StopIteration:
+                    pseudo_iter = iter(pseudo_loader)
+                    Xp, Yp = next(pseudo_iter)
+                if Xp.size(0) > 1:
+                    Xp, Yp = Xp.to(device), Yp.to(device)
+                    feat_p = G(Xp)
+                    l_st = (F.mse_loss(F1(feat_p), Yp)
+                            + F.mse_loss(F2(feat_p), Yp))
+                    loss_stepA = loss_stepA + args.st_weight * l_st
+                    stats["st"] += float(l_st) * bsz
+
+            opt_g.zero_grad(); opt_f.zero_grad()
+            loss_stepA.backward()
+            opt_g.step(); opt_f.step()
+
+            # Accumulated here, before Step B reassigns the source losses.
+            stats["mse1"] += loss_s1.item() * bsz
+            stats["mse2"] += loss_s2.item() * bsz
+            stats["n"] += bsz
+            stats["nb"] += 1
+
+            # ---- Steps B and C: MCD only ----
+            if args.MCD_activated:
+                # Step B: heads maximise target discrepancy, backbone frozen.
+                for p in G.parameters():
+                    p.requires_grad = False
+                for p in head_params:
+                    p.requires_grad = True
+
+                feat_s_d = G(X_s).detach()
+                feat_t_d = G(X_t).detach()
+
+                pred_s1, pred_s2 = F1(feat_s_d), F2(feat_s_d)
+                pred_t1, pred_t2 = F1(feat_t_d), F2(feat_t_d)
+
+                dis = discrepancy_loss(pred_t1, pred_t2)
+                vpen = variance_penalty(pred_t1, pred_t2)
+
+                # Minimising a negative 'dis' term maximises the discrepancy
+                loss_stepB = (F.mse_loss(pred_s1, Y_s)
+                              + F.mse_loss(pred_s2, Y_s)
+                              + da_weight * (args.gamma * vpen
+                                             - args.eta * dis))
+
+                opt_f.zero_grad()
+                loss_stepB.backward()
+                opt_f.step()
+
+                # Step C: backbone minimises target discrepancy, heads frozen.
+                for p in G.parameters():
+                    p.requires_grad = True
+                for p in head_params:
+                    p.requires_grad = False
+
+                feat_t = G(X_t)
+                pred_t1, pred_t2 = F1(feat_t), F2(feat_t)
+
+                dis = discrepancy_loss(pred_t1, pred_t2)
+                vpen = variance_penalty(pred_t1, pred_t2)
+
+                # Minimising positive 'dis' pulls the target inside the boundary
+                loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
+
+                opt_g.zero_grad()
+                loss_stepC.backward()
+                opt_g.step()
+
+                stats["dis"] += float(dis.detach())
+                stats["vpen"] += float(vpen.detach())
+
+        sch_g.step(); sch_f.step()
+
+        n, nb = max(stats["n"], 1), max(stats["nb"], 1)
+        mae, rmse, r2, corr = evaluate(G, F1, F2, val_loader, device, normalizer)
+        metrics = (mae, rmse, r2, corr)
+
+        log = {
+            "MSE1": stats["mse1"] / n,
+            "MSE2": stats["mse2"] / n,
+            "MAE": mae, "RMSE": rmse, "R2": r2, "Corr": corr,
+            "da_weight": da_weight,
+            "phase": phase,
+            "lr_g": opt_g.param_groups[0]["lr"],
+            "lr_f": opt_f.param_groups[0]["lr"],
+        }
+        if args.MCD_activated:
+            log["discrepancy_trg"] = stats["dis"] / nb
+            log["variance_penalty"] = stats["vpen"] / nb
+        if pseudo_iter is not None:
+            log["mse_pseudo"] = stats["st"] / n
+        mlflow.log_metrics(log, step=gstep)
+
+        print(f"  ep {gstep:03d} da={da_weight:.2f} "
+              f"MSE1={stats['mse1']/n:.4f} MSE2={stats['mse2']/n:.4f} "
+              f"MAE={mae:.4f} RMSE={rmse:.4f} R2={r2:.4f} Corr={corr:.4f}")
+
+    return metrics
 
 def train(args):
     set_seed(args.seed)
@@ -289,11 +398,11 @@ def train(args):
         X_s, Y_s = load_data(source_x_path, source_y_path)
         source_domains.append((X_s, Y_s))
 
-    #concat
+    # concat -- no domain labels anywhere, the sources are pooled
     X_src_all = np.concatenate([X for X, Y in source_domains], axis=0)
     Y_src_all = np.concatenate([Y for X, Y in source_domains], axis=0)
 
-    #normalize
+    # normalize on source only; target statistics would leak
     normalizer = Normalizer().fit(X_src_all, Y_src_all)
 
     X_src_n = normalizer.transform_X(X_src_all)
@@ -302,12 +411,12 @@ def train(args):
     target_X_n = normalizer.transform_X(target_X)
     target_Y_n = normalizer.transform_Y(target_Y)
 
-    #split in train/eval
+    # split in train/eval
     (trg_train_X, trg_train_Y), (trg_val_X, trg_val_Y) = split_domain(
-            target_X_n, target_Y_n, val_ratio=0.2, seed = args.seed)
+        target_X_n, target_Y_n, val_ratio=0.2, seed=args.seed)
 
-    #Dataloader
-
+    # Dataloader. trg_train_Y is never used in a loss -- the target training
+    # split is unlabelled as far as the method is concerned.
     src_loader = make_loader(X_src_n, Y_src_n, args.batch_size)
     trg_loader = make_loader(trg_train_X, trg_train_Y, args.batch_size)
     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
@@ -320,18 +429,17 @@ def train(args):
         drt_activated=args.DRT_activated
     ).to(device)
 
-    #Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
     F1 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
     F2 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
 
     opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
-    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),lr=args.lr_f, momentum=0.9)
+    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),
+                      lr=args.lr_f, momentum=0.9)
 
-    scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
-    scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
-
-    # We only need to iterate through target batches if MCD or ST is active
-    use_target = args.MCD_activated or args.ST_activated
+    sch_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule,
+                                           gamma=0.1)
+    sch_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule,
+                                           gamma=0.1)
 
     run_name = (f"{args.target_x_dict.replace('X_', '').replace('.csv', '')}"
                 f"_seed{args.seed}")
@@ -339,187 +447,249 @@ def train(args):
     with mlflow.start_run(run_name=run_name, nested=True):
         mlflow.log_params({k: (str(v) if isinstance(v, (list, tuple)) else v)
                            for k, v in vars(args).items()})
-        if use_target:
-            trg_iter = iter(trg_loader)
+        mlflow.log_param("n_params_G", sum(p.numel() for p in G.parameters()))
 
-        for epoch in range(1, args.epochs + 1):
-            G.train()
-            F1.train()
-            F2.train()
-            #Router.train()
+        # ---- Phase 1 ----
+        metrics = run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f,
+                            src_loader, trg_loader, val_loader, normalizer,
+                            device, args, args.epochs, 0, phase=0)
 
-            # Discrepancy warmup factor
-            if epoch <= args.warmup_epochs:
-                da_weight = 0.0
+        # ---- Phase 2: self-training, a second round as in the paper ----
+        if args.ST_activated:
+            Xp, Yp, keep_rate, thr = make_pseudo_labels(
+                G, F1, F2, trg_train_X, device, args.st_keep_quantile)
+
+            mlflow.log_metrics({"st_keep_rate": keep_rate,
+                                "st_threshold": thr,
+                                "st_n_pseudo": float(len(Xp))})
+            print(f"  [ST] kept {keep_rate:.1%} of target samples "
+                  f"({len(Xp)} pseudo-labelled, thr={thr:.4f})")
+
+            if len(Xp) > args.batch_size:
+                pseudo_loader = make_loader(Xp, Yp, args.batch_size)
+
+                # Lower learning rate for the refinement round, and a fresh
+                # scheduler with no milestones so it stays constant.
+                for g in opt_g.param_groups:
+                    g["lr"] *= args.st_lr_scale
+                for g in opt_f.param_groups:
+                    g["lr"] *= args.st_lr_scale
+                sch_g = optim.lr_scheduler.MultiStepLR(opt_g, [], gamma=0.1)
+                sch_f = optim.lr_scheduler.MultiStepLR(opt_f, [], gamma=0.1)
+
+                metrics = run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f,
+                                    src_loader, trg_loader, val_loader,
+                                    normalizer, device, args, args.st_epochs,
+                                    args.epochs, phase=1,
+                                    pseudo_loader=pseudo_loader)
             else:
-                da_weight = min(1.0, (epoch - args.warmup_epochs) / 20.0)
+                print(f"  [ST] skipped: only {len(Xp)} samples kept, "
+                      f"need > {args.batch_size}")
 
-            stats = {"mse1": 0.0, "mse2": 0.0, "n": 0}
-
-            for X_s, Y_s in src_loader:
-                bsz = X_s.size(0)
-                X_s, Y_s = X_s.to(device), Y_s.to(device)
-
-                if use_target:
-                    try:
-                        X_t, _ = next(trg_iter)
-                    except StopIteration:
-                        trg_iter = iter(trg_loader)
-                        X_t, _ = next(trg_iter)
-                    X_t = X_t.to(device)
-
-                # Step A: supervised (and ST)
-                # calculate gradients
-                for p in G.parameters(): p.requires_grad = True
-                for p in  list(F1.parameters()) + list(F2.parameters()):
-                    p.requires_grad = True
-
-                feat_s = G(X_s)
-                #sub1_s, sub2_s = Router(feat_s)
-                pred_s1 = F1(feat_s)
-                pred_s2 = F2(feat_s)
-
-                loss_s1 = F.mse_loss(pred_s1, Y_s)
-                loss_s2 = F.mse_loss(pred_s2, Y_s)
-                loss_stepA = loss_s1 + loss_s2
-
-                #logg params
-                st_keep_rate = 0.0
-
-                # Self-Training Block
-                if args.ST_activated and epoch > args.warmup_epochs: # use st only after warmup to not train on incorrect predictions
-                    # eval mode for turn off batch norm and dropout
-                    G.eval()
-                    #Router.eval()
-                    F1.eval()
-                    F2.eval()
-
-                    # dont calculate gradients for pseudo-label generation
-                    with torch.no_grad():
-                        feat_t_st = G(X_t)
-                        #sub1_t_st, sub2_t_st = Router(feat_t_st)
-                        pred_t1_st = F1(feat_t_st)
-                        pred_t2_st = F2(feat_t_st)
-
-                        # pseudo-label via average
-                        pseudo_Y = (pred_t1_st + pred_t2_st) / 2.0
-
-                        # uses consensus instead of confidence ->  distance head predictions
-                        discrepancy = torch.abs(pred_t1_st - pred_t2_st)
-
-                        # dynamic threshold
-                        st_threshold = Y_s.std().item() * 0.1
-                        confident_mask = (discrepancy < st_threshold).squeeze(-1)
-
-                        # for logging
-                        st_keep_rate = confident_mask.float().mean().item()
-
-                    # switch back to gradient calculation for training
-                    G.train()
-                    #Router.train()
-                    F1.train()
-                    F2.train()
-
-                    if confident_mask.sum() > 1: #only if we have more than two for batchnorm
-
-                        # forward pass with gradients on selected target data
-                        feat_t_conf = G(X_t[confident_mask])
-                        #sub1_t_conf, sub2_t_conf = Router(feat_t_conf)
-                        pred_t1_conf = F1(feat_t_conf)
-                        pred_t2_conf = F2(feat_t_conf)
-
-                        loss_st = 0.5 * (
-                                F.mse_loss(pred_t1_conf, pseudo_Y[confident_mask]) +
-                                F.mse_loss(pred_t2_conf, pseudo_Y[confident_mask])
-                        )
-                        loss_stepA += da_weight * loss_st # scale depending on warmup for MCD
-
-                opt_g.zero_grad()
-                opt_f.zero_grad()
-                loss_stepA.backward()
-                opt_g.step()
-                opt_f.step()
-
-                stats["mse1"] += loss_s1.item() * bsz
-                stats["mse2"] += loss_s2.item() * bsz
-                stats["n"] += bsz
-
-                # Step B and C only for MCD
-                if args.MCD_activated:
-                    # Step B: Train Router / Heads (Maximize Target Discrepancy)
-                    # Freeze backbone G
-                    for p in G.parameters(): p.requires_grad = False
-                    for p in list(F1.parameters()) + list(F2.parameters()):
-                        p.requires_grad = True
-
-                    feat_s = G(X_s).detach()
-                    feat_t = G(X_t).detach()
-
-                    #sub1_s, sub2_s = Router(feat_s)
-                    #sub1_t, sub2_t = Router(feat_t)
-
-                    pred_s1 = F1(feat_s)
-                    pred_s2 = F2(feat_s)
-                    pred_t1 = F1(feat_t)
-                    pred_t2 = F2(feat_t)
-
-                    loss_s1 = F.mse_loss(pred_s1, Y_s)
-                    loss_s2 = F.mse_loss(pred_s2, Y_s)
-                    dis = discrepancy_loss(pred_t1, pred_t2)
-                    vpen = variance_penalty(pred_t1, pred_t2)
-
-                    # Minimizing a negative 'dis' term maximizes the discrepancy boundary
-                    loss_stepB = (loss_s1 + loss_s2) + da_weight * (args.gamma * vpen - args.eta * dis)
-
-                    opt_f.zero_grad()
-                    loss_stepB.backward()
-                    opt_f.step()  # only update Router/ Heads
-
-                    # Step C: Train Backbone G (Minimize Target Discrepancy)
-                    # Freeze Router and Heads
-                    for p in G.parameters(): p.requires_grad = True
-                    for p in list(F1.parameters()) + list(F2.parameters()):
-                        p.requires_grad = False
-
-                    feat_t = G(X_t)
-                    #sub1_t, sub2_t = Router(feat_t)
-                    pred_t1 = F1(feat_t)
-                    pred_t2 = F2(feat_t)
-
-                    dis = discrepancy_loss(pred_t1, pred_t2)
-                    vpen = variance_penalty(pred_t1, pred_t2)
-
-                    # Minimizing positive 'dis' aligns target domain inside the boundaries
-                    loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
-
-                    opt_g.zero_grad()
-                    loss_stepC.backward()
-                    opt_g.step()  # Only update Backbone G
-
-
-            scheduler_g.step()
-            scheduler_f.step()
-
-            n = stats["n"]
-            print(f"Epoch {epoch:03d}/{args.epochs} " #DA:{da_str}  "
-                  f"MSE1={stats['mse1'] / n:.4f}  MSE2={stats['mse2'] / n:.4f}  "
-                  )
-
-            mae, rmse, r2, corr = evaluate(G, F1, F2, val_loader, device, normalizer)
-            print(f"  MAE={mae:.4f}  RMSE={rmse:.4f}  R²={r2:.4f} Corr.={corr:.4f}" )
-
-            mlflow.log_metrics(
-                {
-                    "MSE1": stats['mse1']/n,
-                    "MSE2": stats['mse2']/n,
-                    "MAE": mae,
-                    "RMSE": rmse,
-                    "R²": r2,
-                    "Corr.": corr,
-                },
-                step=epoch,
-            )
+    mae, rmse, r2, corr = metrics
     return r2, corr
+
+# def train(args):
+#     set_seed(args.seed)
+#
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#
+#     # load target domain and labels
+#     target_x_path = os.path.join(args.data_dict_path, args.target_x_dict)
+#     target_y_path = os.path.join(args.data_dict_path, args.target_y_dict)
+#     target_X, target_Y = load_data(target_x_path, target_y_path)
+#
+#     # load source domains
+#     source_domains = []
+#     x_src_dicts = args.source_x_dicts.split(",")
+#     y_src_dicts = args.source_y_dicts.split(",")
+#
+#     for i in range(len(x_src_dicts)):
+#         source_x_path = os.path.join(args.data_dict_path, x_src_dicts[i])
+#         source_y_path = os.path.join(args.data_dict_path, y_src_dicts[i])
+#         X_s, Y_s = load_data(source_x_path, source_y_path)
+#         source_domains.append((X_s, Y_s))
+#
+#     #concat
+#     X_src_all = np.concatenate([X for X, Y in source_domains], axis=0)
+#     Y_src_all = np.concatenate([Y for X, Y in source_domains], axis=0)
+#
+#     #normalize
+#     normalizer = Normalizer().fit(X_src_all, Y_src_all)
+#
+#     X_src_n = normalizer.transform_X(X_src_all)
+#     Y_src_n = normalizer.transform_Y(Y_src_all)
+#
+#     target_X_n = normalizer.transform_X(target_X)
+#     target_Y_n = normalizer.transform_Y(target_Y)
+#
+#     #split in train/eval
+#     (trg_train_X, trg_train_Y), (trg_val_X, trg_val_Y) = split_domain(
+#             target_X_n, target_Y_n, val_ratio=0.2, seed = args.seed)
+#
+#     #Dataloader
+#
+#     src_loader = make_loader(X_src_n, Y_src_n, args.batch_size)
+#     trg_loader = make_loader(trg_train_X, trg_train_Y, args.batch_size)
+#     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
+#                              shuffle=False, drop_last=False)
+#
+#     G = DynamicBackbone(
+#         in_dim=args.input_dim,
+#         hidden_dim=args.hidden_dim,
+#         K=4,
+#         drt_activated=args.DRT_activated
+#     ).to(device)
+#
+#     #Router = SubspaceRouter(hidden_dim=args.hidden_dim).to(device)
+#     F1 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
+#     F2 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
+#
+#     opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
+#     opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),lr=args.lr_f, momentum=0.9)
+#
+#     scheduler_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule, gamma=0.1)
+#     scheduler_f = optim.lr_scheduler.MultiStepLR(opt_f, milestones=args.schedule, gamma=0.1)
+#
+#     # We only need to iterate through target batches if MCD or ST is active
+#     use_target = args.MCD_activated or args.ST_activated
+#
+#     run_name = (f"{args.target_x_dict.replace('X_', '').replace('.csv', '')}"
+#                 f"_seed{args.seed}")
+#
+#     with mlflow.start_run(run_name=run_name, nested=True):
+#         mlflow.log_params({k: (str(v) if isinstance(v, (list, tuple)) else v)
+#                            for k, v in vars(args).items()})
+#         if use_target:
+#             trg_iter = iter(trg_loader)
+#
+#         for epoch in range(1, args.epochs + 1):
+#             G.train()
+#             F1.train()
+#             F2.train()
+#             #Router.train()
+#
+#             # Discrepancy warmup factor
+#             if epoch <= args.warmup_epochs:
+#                 da_weight = 0.0
+#             else:
+#                 da_weight = min(1.0, (epoch - args.warmup_epochs) / 20.0)
+#
+#             stats = {"mse1": 0.0, "mse2": 0.0, "n": 0}
+#
+#             for X_s, Y_s in src_loader:
+#                 bsz = X_s.size(0)
+#                 X_s, Y_s = X_s.to(device), Y_s.to(device)
+#
+#                 if use_target:
+#                     try:
+#                         X_t, _ = next(trg_iter)
+#                     except StopIteration:
+#                         trg_iter = iter(trg_loader)
+#                         X_t, _ = next(trg_iter)
+#                     X_t = X_t.to(device)
+#
+#                 # Step A: supervised (and ST)
+#                 # calculate gradients
+#                 for p in G.parameters(): p.requires_grad = True
+#                 for p in  list(F1.parameters()) + list(F2.parameters()):
+#                     p.requires_grad = True
+#
+#                 feat_s = G(X_s)
+#                 #sub1_s, sub2_s = Router(feat_s)
+#                 pred_s1 = F1(feat_s)
+#                 pred_s2 = F2(feat_s)
+#
+#                 loss_s1 = F.mse_loss(pred_s1, Y_s)
+#                 loss_s2 = F.mse_loss(pred_s2, Y_s)
+#                 loss_stepA = loss_s1 + loss_s2
+#
+#                 opt_g.zero_grad()
+#                 opt_f.zero_grad()
+#                 loss_stepA.backward()
+#                 opt_g.step()
+#                 opt_f.step()
+#
+#                 stats["mse1"] += loss_s1.item() * bsz
+#                 stats["mse2"] += loss_s2.item() * bsz
+#                 stats["n"] += bsz
+#
+#                 # Step B and C only for MCD
+#                 if args.MCD_activated:
+#                     # Step B: Train Router / Heads (Maximize Target Discrepancy)
+#                     # Freeze backbone G
+#                     for p in G.parameters(): p.requires_grad = False
+#                     for p in list(F1.parameters()) + list(F2.parameters()):
+#                         p.requires_grad = True
+#
+#                     feat_s = G(X_s).detach()
+#                     feat_t = G(X_t).detach()
+#
+#                     #sub1_s, sub2_s = Router(feat_s)
+#                     #sub1_t, sub2_t = Router(feat_t)
+#
+#                     pred_s1 = F1(feat_s)
+#                     pred_s2 = F2(feat_s)
+#                     pred_t1 = F1(feat_t)
+#                     pred_t2 = F2(feat_t)
+#
+#                     loss_s1 = F.mse_loss(pred_s1, Y_s)
+#                     loss_s2 = F.mse_loss(pred_s2, Y_s)
+#                     dis = discrepancy_loss(pred_t1, pred_t2)
+#                     vpen = variance_penalty(pred_t1, pred_t2)
+#
+#                     # Minimizing a negative 'dis' term maximizes the discrepancy boundary
+#                     loss_stepB = (loss_s1 + loss_s2) + da_weight * (args.gamma * vpen - args.eta * dis)
+#
+#                     opt_f.zero_grad()
+#                     loss_stepB.backward()
+#                     opt_f.step()  # only update Router/ Heads
+#
+#                     # Step C: Train Backbone G (Minimize Target Discrepancy)
+#                     # Freeze Router and Heads
+#                     for p in G.parameters(): p.requires_grad = True
+#                     for p in list(F1.parameters()) + list(F2.parameters()):
+#                         p.requires_grad = False
+#
+#                     feat_t = G(X_t)
+#                     #sub1_t, sub2_t = Router(feat_t)
+#                     pred_t1 = F1(feat_t)
+#                     pred_t2 = F2(feat_t)
+#
+#                     dis = discrepancy_loss(pred_t1, pred_t2)
+#                     vpen = variance_penalty(pred_t1, pred_t2)
+#
+#                     # Minimizing positive 'dis' aligns target domain inside the boundaries
+#                     loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
+#
+#                     opt_g.zero_grad()
+#                     loss_stepC.backward()
+#                     opt_g.step()  # Only update Backbone G
+#
+#
+#             scheduler_g.step()
+#             scheduler_f.step()
+#
+#             n = stats["n"]
+#             print(f"Epoch {epoch:03d}/{args.epochs} " #DA:{da_str}  "
+#                   f"MSE1={stats['mse1'] / n:.4f}  MSE2={stats['mse2'] / n:.4f}  "
+#                   )
+#
+#             mae, rmse, r2, corr = evaluate(G, F1, F2, val_loader, device, normalizer)
+#             print(f"  MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f} Corr.={corr:.4f}" )
+#
+#             mlflow.log_metrics(
+#                 {
+#                     "MSE1": stats['mse1']/n,
+#                     "MSE2": stats['mse2']/n,
+#                     "MAE": mae,
+#                     "RMSE": rmse,
+#                     "R2": r2,
+#                     "Corr.": corr,
+#                 },
+#                 step=epoch,
+#             )
+#     return r2, corr
 
 
 def parse_args():
@@ -540,9 +710,19 @@ def parse_args():
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
+
+    # switches
     p.add_argument("--MCD_activated", type=bool, default=False, help="If False source only")
     p.add_argument("--DRT_activated", type=bool, default=False)
     p.add_argument("--ST_activated", type=bool, default=False)
+
+    # self-training
+    p.add_argument("--st_epochs", type=int, default=30)
+    p.add_argument("--st_keep_quantile", type=float, default=0.5)
+    p.add_argument("--st_weight", type=float, default=1.0)
+    p.add_argument("--st_lr_scale", type=float, default=0.1)
+
+
 
     return p.parse_args()
 
@@ -568,7 +748,7 @@ def main():
         (False, True, False),
         (True, False, False),
         (True, True, False),
-        (True, True, True)
+        # (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
@@ -622,7 +802,7 @@ def main():
                 all_target_corr_means.append(mean_corr)
                 print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
 
-            mlflow.log_metrics({"mean_R²": float(np.mean(all_target_r2_means)),
+            mlflow.log_metrics({"mean_R2": float(np.mean(all_target_r2_means)),
                                 "mean_Corr": float(np.mean(all_target_corr_means))})
 
         output_file = "drt_training_results.txt"
@@ -634,7 +814,7 @@ def main():
             f.write(header)
 
             for target_name, (mean_r2, std_r2, mean_corr, std_corr) in final_summary.items():
-                target_info = f"Target: {target_name}\n R²: {mean_r2:.4f} ± {std_r2:.4f}\n Correlation: {mean_corr:.4f} ± {std_corr}\n" + "-" * 40 + "\n"
+                target_info = f"Target: {target_name}\n R2: {mean_r2:.4f} ± {std_r2:.4f}\n Correlation: {mean_corr:.4f} ± {std_corr}\n" + "-" * 40 + "\n"
                 print(target_info, end="")
                 f.write(target_info)
 
@@ -644,7 +824,7 @@ def main():
             average_all_corr = np.mean(all_target_corr_means, dtype=np.float64)
             std_all_corr = np.std(all_target_corr_means, ddof=1)
 
-            footer = f"Average Across All Targets:\n R²: {average_all_r2:.4f} ± {std_all_r2:.4f}\n Correlation: {average_all_corr:.4f} ± {std_all_corr:.4f}\n" + "=" * 40 + "\n\n"
+            footer = f"Average Across All Targets:\n R2: {average_all_r2:.4f} ± {std_all_r2:.4f}\n Correlation: {average_all_corr:.4f} ± {std_all_corr:.4f}\n" + "=" * 40 + "\n\n"
             print(footer, end="")
             f.write(footer)
 

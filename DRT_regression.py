@@ -527,7 +527,7 @@ def run_epochs(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
         log = {f"{log_prefix}MSE1": acc["mse1"] / n,
                f"{log_prefix}MSE2": acc["mse2"] / n,
                f"{log_prefix}MAE": mae, f"{log_prefix}RMSE": rmse,
-               f"{log_prefix}R²": r2, f"{log_prefix}Corr": corr,
+               f"{log_prefix}R2": r2, f"{log_prefix}Corr": corr,
                f"{log_prefix}da_weight": da_w}
         if acc["nb"]:
             log[f"{log_prefix}discrepancy"] = acc["dis"] / acc["nb"]
@@ -545,7 +545,7 @@ def run_epochs(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
 
         print(f"  ep {gstep:03d} da={da_w:.2f} "
               f"MSE1={acc['mse1']/n:.4f} MSE2={acc['mse2']/n:.4f} "
-              f"MAE={mae:.4f} RMSE={rmse:.4f} R²={r2:.4f} corr={corr:.4f}")
+              f"MAE={mae:.4f} RMSE={rmse:.4f} R2={r2:.4f} corr={corr:.4f}")
 
     return metrics
 
@@ -802,18 +802,18 @@ def main():
                                  float(np.mean(corrs)), float(np.std(corrs, ddof=1)))
                 all_r2.append(np.mean(r2s)); all_corr.append(np.mean(corrs))
                 print(f"Finished target {name}: "
-                      f"R² {summary[name][0]:.4f} +- {summary[name][1]:.4f}")
+                      f"R2 {summary[name][0]:.4f} +- {summary[name][1]:.4f}")
 
-            mlflow.log_metrics({"mean_R²": float(np.mean(all_r2)),
+            mlflow.log_metrics({"mean_R2": float(np.mean(all_r2)),
                                 "mean_Corr": float(np.mean(all_corr))})
 
         with open(args.results_file, "a", encoding="utf-8") as f:
             f.write(f"Results for configuration: {config}\n" + "-" * 40 + "\n")
             for name, (m_r2, s_r2, m_c, s_c) in summary.items():
-                f.write(f"Target: {name}\n R²: {m_r2:.4f} +- {s_r2:.4f}\n"
+                f.write(f"Target: {name}\n R2: {m_r2:.4f} +- {s_r2:.4f}\n"
                         f" Correlation: {m_c:.4f} +- {s_c:.4f}\n" + "-" * 40 + "\n")
             f.write(f"Average across all targets:\n"
-                    f" R²: {np.mean(all_r2):.4f} +- {np.std(all_r2, ddof=1):.4f}\n"
+                    f" R2: {np.mean(all_r2):.4f} +- {np.std(all_r2, ddof=1):.4f}\n"
                     f" Correlation: {np.mean(all_corr):.4f} "
                     f"+- {np.std(all_corr, ddof=1):.4f}\n" + "=" * 40 + "\n\n")
 
