@@ -77,7 +77,7 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
                       drop_last=drop_last)
 
 class DynamicLinear(nn.Module):
-    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16):
+    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16, basis_scale=0.1):
         super().__init__()
         self.last_pi = None
         self.K = K
@@ -91,7 +91,13 @@ class DynamicLinear(nn.Module):
 
         # basis matrices for subspace routing
         self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim))
-        nn.init.zeros_(self.residual_weights)
+        # Small but non-zero and mutually distinct. With Phi_k == 0 the router
+        # gets exactly zero gradient on the first step, and all K bases receive
+        # identical gradients thereafter, which drives them together.
+        with torch.no_grad():
+            for k in range(K):
+                nn.init.kaiming_uniform_(self.residual_weights[k], a=np.sqrt(5))
+            self.residual_weights.mul_(basis_scale / np.sqrt(K))
 
         # ONE shared lightweight branch feeds both Λ(x) and π(x),
         # mirroring the single attention branch in the paper's Fig. 3
@@ -125,12 +131,12 @@ class DynamicLinear(nn.Module):
         # return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
 
 class DynamicBackbone(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True):
+    def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True, basis_scale=0.1):
         super().__init__()
-        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated)
+        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
         self.bn1, self.relu1 = nn.BatchNorm1d(256), nn.ReLU()
 
-        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated)
+        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
         self.bn2, self.relu2 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
 
     def forward(self, x):
@@ -445,7 +451,8 @@ def train(args):
         in_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         K= args.K,
-        drt_activated=args.DRT_activated
+        drt_activated=args.DRT_activated,
+        basis_scale = args.basis_scale
     ).to(device)
 
     F1 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
@@ -526,11 +533,6 @@ def train(args):
                 mlflow.log_artifact(path)
                 for i, e in enumerate(ents):
                     mlflow.log_metric(f"final_pi_entropy_l{i + 1}", e)
-                for i, s in enumerate(sims):
-                    if s is not None:
-                        mlflow.log_metric(f"final_basis_sim_l{i + 1}", s)
-                print(f"  [pi] entropy={['%.3f' % e for e in ents]} "
-                      f"basis_sim={['%.3f' % s for s in sims]} -> {path}")
 
     mae, rmse, r2, corr = metrics
     return r2, corr
@@ -546,27 +548,25 @@ def parse_args():
     p.add_argument("--source_y_dicts", type=str, default="Y_anim10.csv,Y_anim3.csv,Y_anim4.csv,Y_anim8.csv")
 
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=60, help="source-only training")
+    p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
 
     p.add_argument("--input_dim", type=int, default=14)
     p.add_argument("--hidden_dim", type=int, default=128)
-    p.add_argument("--schedule", type=int, nargs="+", default=[100, 125, 140])
+    p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
 
     # DRT
     p.add_argument("--K", type=int, default=4)
+    p.add_argument("--basis_scale", type=float, default=0.1, help="init scale of the Phi_i basis matrices")
+    p.add_argument("--pi_dump_dir", type=str, default="pi_dumps")
+    p.add_argument("--pi_max_per_domain", type=int, default=2000)
 
     #MCD
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
-
-    # switches
-    p.add_argument("--MCD_activated", type=bool, default=False, help="If False source only")
-    p.add_argument("--DRT_activated", type=bool, default=False)
-    p.add_argument("--ST_activated", type=bool, default=False)
 
     # self-training
     p.add_argument("--st_epochs", type=int, default=30)
@@ -574,9 +574,12 @@ def parse_args():
     p.add_argument("--st_weight", type=float, default=1.0)
     p.add_argument("--st_lr_scale", type=float, default=0.1)
 
-    # pi
-    p.add_argument("--pi_dump_dir", type=str, default="pi_dumps")
-    p.add_argument("--pi_max_per_domain", type=int, default=2000)
+    # switches
+    p.add_argument("--MCD_activated", type=bool, default=False, help="If False source only")
+    p.add_argument("--DRT_activated", type=bool, default=False)
+    p.add_argument("--ST_activated", type=bool, default=False)
+
+
 
     return p.parse_args()
 
@@ -598,11 +601,11 @@ def main():
     animal_pool = list(zip(x_dicts, y_dicts))
 
     allowed_values = [
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
+        # (False, False, False),
+        # (False, True, False),
+        # (True, False, False),
         (True, True, False),
-        (True, True, True)
+        # (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
