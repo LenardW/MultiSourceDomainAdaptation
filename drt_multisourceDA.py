@@ -618,6 +618,7 @@ def main():
 
         final_summary = {}
         all_target_r2_means = []
+        all_target_r2_raw_means = []
         all_target_corr_means = []
 
         with mlflow.start_run(run_name=f"mcd_{int(args.MCD_activated)}"
@@ -639,27 +640,31 @@ def main():
                 args.source_x_dicts = sources_x_str
                 args.source_y_dicts = sources_y_str
 
-                seed_r2 = []
-                seed_corr = []
+                seed_r2, seed_corr, seed_r2_raw = [], [], []
 
                 for i in range(len(seeds)):
                     args.seed = seeds[i]
                     run_r2, run_corr = train(args)
-                    seed_r2.append(run_r2)
+                    seed_r2.append(max(run_r2, -1.0))
+                    seed_r2_raw.append(run_r2)
                     seed_corr.append(run_corr)
 
                 mean_r2 = np.mean(seed_r2)
                 std_r2 = np.std(seed_r2, ddof=1) # sample std
+                mean_raw_r2 = np.mean(seed_r2_raw)
+                std_raw_r2 = np.std(seed_r2_raw, ddof=1) # sample std
 
                 mean_corr =  np.mean(seed_corr)
                 std_corr = np.std(seed_corr, ddof=1)
 
-                final_summary[target_name] = (mean_r2, std_r2, mean_corr, std_corr)
+                final_summary[target_name] = (mean_r2, std_r2, mean_raw_r2, std_raw_r2, mean_corr, std_corr)
                 all_target_r2_means.append(mean_r2)
+                all_target_r2_raw_means.append(mean_raw_r2)
                 all_target_corr_means.append(mean_corr)
                 print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
 
             mlflow.log_metrics({"mean_R2": float(np.mean(all_target_r2_means)),
+                                "mean_raw_R2": float(np.mean(all_target_r2_raw_means)),
                                 "mean_Corr": float(np.mean(all_target_corr_means))})
 
         output_file = "drt_training_results.txt"
@@ -670,18 +675,21 @@ def main():
             print(header, end="")
             f.write(header)
 
-            for target_name, (mean_r2, std_r2, mean_corr, std_corr) in final_summary.items():
-                target_info = f"Target: {target_name}\n R2: {mean_r2:.4f} ± {std_r2:.4f}\n Correlation: {mean_corr:.4f} ± {std_corr}\n" + "-" * 40 + "\n"
+            for target_name, (mean_r2, std_r2, mean_raw_r2, std_raw_r2, mean_corr, std_corr) in final_summary.items():
+                target_info = f"Target: {target_name}\n R2: {mean_r2:.2f} ± {std_r2:.2f}\n R2 Raw: {mean_raw_r2:.2f} ± {std_raw_r2:.2f}\n Correlation: {mean_corr:.2f} ± {std_corr}\n" + "-" * 40 + "\n"
                 print(target_info, end="")
                 f.write(target_info)
 
             average_all_r2 = np.mean(all_target_r2_means, dtype=np.float64)
             std_all_r2 = np.std(all_target_r2_means, ddof=1)
 
+            average_all_raw_r2 = np.mean(all_target_r2_raw_means, dtype=np.float64)
+            std_all_raw_r2 = np.std(all_target_r2_raw_means, ddof=1)
+
             average_all_corr = np.mean(all_target_corr_means, dtype=np.float64)
             std_all_corr = np.std(all_target_corr_means, ddof=1)
 
-            footer = f"Average Across All Targets:\n R2: {average_all_r2:.4f} ± {std_all_r2:.4f}\n Correlation: {average_all_corr:.4f} ± {std_all_corr:.4f}\n" + "=" * 40 + "\n\n"
+            footer = f"Average Across All Targets:\n R2: {average_all_r2:.4f} ± {std_all_r2:.4f}\n R2 Raw: {average_all_raw_r2:.2f} ± {std_all_raw_r2:.2f}\n Correlation: {average_all_corr:.4f} ± {std_all_corr:.4f}\n" + "=" * 40 + "\n\n"
             print(footer, end="")
             f.write(footer)
 
