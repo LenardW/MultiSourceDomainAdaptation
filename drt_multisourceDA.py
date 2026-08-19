@@ -82,6 +82,8 @@ class DynamicLinear(nn.Module):
         self.last_pi = None
         self.K = K
         self.drt_activated = drt_activated
+        self.in_dim = in_dim
+        self.out_dim = out_dim
 
         #static component
         self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim))
@@ -112,22 +114,28 @@ class DynamicLinear(nn.Module):
             self.last_pi = None
             return F.linear(x, self.static_weight, self.static_bias)
 
+
+        z0 = F.linear(x, self.static_weight)              # W_0 x, bias held back
         h = self.branch(x)
         lam = torch.sigmoid(self.to_lambda(h))           # [B, out_dim]
         pi  = torch.softmax(self.to_pi(h), dim=-1)        # [B, K]
         self.last_pi = pi.detach()
 
-        lam_term = lam.unsqueeze(-1) * self.static_weight.unsqueeze(0)     # Λ(x)W_0, per sample
-        pi_term  = torch.einsum('bk,kij->bij', pi, self.residual_weights)  # Σπ_i(x)Φ_i
+        # Lambda(x) W_0 x  ==  lam * (W_0 x), since Lambda is diagonal
+        out = z0 + lam * z0
 
-        weight = self.static_weight.unsqueeze(0) + lam_term + pi_term
-        return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
+        # all K projections in one GEMM: [B, K*out] -> [B, K, out]
+        z = F.linear(x, self.residual_weights.reshape(self.K * self.out_dim,
+                                                      self.in_dim))
+        z = z.view(-1, self.K, self.out_dim)
+        out = out + (z * pi.unsqueeze(-1)).sum(dim=1)
 
-        # # Dynamically blend residual weights per sample based on routing paths
-        # res_w = torch.einsum('bk,kij->bij', routing_weights, self.residual_weights)
-        # weight = self.static_weight.unsqueeze(0) + res_w  # [B, out_dim, in_dim]
+        return out + self.static_bias
+
+        # lam_term = lam.unsqueeze(-1) * self.static_weight.unsqueeze(0)     # Λ(x)W_0, per sample
+        # pi_term  = torch.einsum('bk,kij->bij', pi, self.residual_weights)  # Σπ_i(x)Φ_i
         #
-        # # Batch matrix multiplication: applying custom blended weights to each sample
+        # weight = self.static_weight.unsqueeze(0) + lam_term + pi_term
         # return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
 
 class DynamicBackbone(nn.Module):
@@ -601,11 +609,11 @@ def main():
     animal_pool = list(zip(x_dicts, y_dicts))
 
     allowed_values = [
-        # (False, False, False),
-        # (False, True, False),
-        # (True, False, False),
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
         (True, True, False),
-        # (True, True, True)
+        (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
