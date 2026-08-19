@@ -549,7 +549,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="DRT")
 
     # paths
-    p.add_argument("--data_dict_path", type=str, default="C:/Users/leona/PythonScripts/MasterThesis/Tierdaten/")
+    p.add_argument("--data_dict_path", type=str, default="Tierdaten/")
     p.add_argument("--target_x_dict", type=str, default="X_anim1.csv")
     p.add_argument("--target_y_dict", type=str, default="Y_anim1.csv")
     p.add_argument("--source_x_dicts", type=str, default="X_anim10.csv,X_anim3.csv,X_anim4.csv,X_anim8.csv")
