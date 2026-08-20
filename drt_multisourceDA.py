@@ -96,6 +96,9 @@ class DynamicLinear(nn.Module):
         # Small but non-zero and mutually distinct. With Phi_k == 0 the router
         # gets exactly zero gradient on the first step, and all K bases receive
         # identical gradients thereafter, which drives them together.
+
+
+        # nn.init.zeros_(self.residual_weights)
         with torch.no_grad():
             for k in range(K):
                 nn.init.kaiming_uniform_(self.residual_weights[k], a=np.sqrt(5))
@@ -360,18 +363,19 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
                 for p in head_params:
                     p.requires_grad = False
 
-                feat_t = G(X_t)
-                pred_t1, pred_t2 = F1(feat_t), F2(feat_t)
+                for _ in range(args.num_k):
+                    feat_t = G(X_t)
+                    pred_t1, pred_t2 = F1(feat_t), F2(feat_t)
 
-                dis = discrepancy_loss(pred_t1, pred_t2)
-                vpen = variance_penalty(pred_t1, pred_t2)
+                    dis = discrepancy_loss(pred_t1, pred_t2)
+                    vpen = variance_penalty(pred_t1, pred_t2)
 
-                # Minimising positive 'dis' pulls the target inside the boundary
-                loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
+                    # Minimising positive 'dis' pulls the target inside the boundary
+                    loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
 
-                opt_g.zero_grad()
-                loss_stepC.backward()
-                opt_g.step()
+                    opt_g.zero_grad()
+                    loss_stepC.backward()
+                    opt_g.step()
 
                 stats["dis"] += float(dis.detach())
                 stats["vpen"] += float(vpen.detach())
@@ -538,7 +542,7 @@ def train(args):
 
             if res is not None:
                 path, ents, sims = res
-                mlflow.log_artifact(path)
+                # mlflow.log_artifact(path)
                 for i, e in enumerate(ents):
                     mlflow.log_metric(f"final_pi_entropy_l{i + 1}", e)
 
@@ -575,6 +579,8 @@ def parse_args():
     #MCD
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
+    p.add_argument("--num_k", type=int, default=4,
+                   help="generator updates per batch in Step C (MCD's num_k)")
 
     # self-training
     p.add_argument("--st_epochs", type=int, default=30)
@@ -609,11 +615,11 @@ def main():
     animal_pool = list(zip(x_dicts, y_dicts))
 
     allowed_values = [
-        (False, False, False),
-        (False, True, False),
+        # (False, False, False),
+        # (False, True, False),
         (True, False, False),
-        (True, True, False),
-        (True, True, True)
+        # (True, True, False),
+        # (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
@@ -650,8 +656,19 @@ def main():
 
                 seed_r2, seed_corr, seed_r2_raw = [], [], []
 
+                total_runs = len(combinations) * len(animal_pool) * len(seeds)
+                run_idx = 0
+
                 for i in range(len(seeds)):
                     args.seed = seeds[i]
+                    run_idx += 1
+                    print(f"\n[{run_idx}/{total_runs}] "
+                          f"mcd={int(args.MCD_activated)} "
+                          f"drt={int(args.DRT_activated)} "
+                          f"st={int(args.ST_activated)} | "
+                          f"target={target_name} | seed={args.seed}",
+                          flush=True)
+
                     run_r2, run_corr = train(args)
                     seed_r2.append(max(run_r2, -1.0))
                     seed_r2_raw.append(run_r2)
