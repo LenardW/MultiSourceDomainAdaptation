@@ -169,6 +169,9 @@ class RegressorHead(nn.Module):
 
 def discrepancy_loss(pred1, pred2):
     return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
+# def discrepancy_loss(pred1, pred2, kind="bounded"):
+#     d = torch.abs(pred1 - pred2)
+#     return d.mean() if kind == "l1" else torch.mean(1.0 - torch.exp(-d))
 
 def variance_penalty(pred1, pred2):
     return -(torch.var(pred1) + torch.var(pred2))
@@ -345,13 +348,16 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
                 dis = discrepancy_loss(pred_t1, pred_t2)
                 vpen = variance_penalty(pred_t1, pred_t2)
 
-                stats["dis_s"] += float(discrepancy_loss(pred_s1, pred_s2).detach())
+                # stats["dis_s"] += float(discrepancy_loss(pred_s1, pred_s2).detach())
 
                 # Minimising a negative 'dis' term maximises the discrepancy
                 loss_stepB = (F.mse_loss(pred_s1, Y_s)
                               + F.mse_loss(pred_s2, Y_s)
                               + da_weight * (args.gamma * vpen
                                              - args.eta * dis))
+                # loss_stepB = (F.mse_loss(pred_s1, Y_s)
+                #               + F.mse_loss(pred_s2, Y_s)
+                #               - da_weight * args.eta * dis)
 
                 opt_f.zero_grad()
                 loss_stepB.backward()
@@ -377,8 +383,14 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
                     loss_stepC.backward()
                     opt_g.step()
 
-                stats["dis"] += float(dis.detach())
-                stats["vpen"] += float(vpen.detach())
+                G.eval()
+                with torch.no_grad():
+                    p1s, p2s = F1(G(X_s)), F2(G(X_s))
+                    p1t, p2t = F1(G(X_t)), F2(G(X_t))
+                    stats["dis_s"] += float(discrepancy_loss(p1s, p2s))
+                    stats["dis"]   += float(discrepancy_loss(p1t, p2t))
+                    stats["vpen"]  += float(variance_penalty(p1t, p2t))
+                G.train()
 
         sch_g.step(); sch_f.step()
 
@@ -398,6 +410,7 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
         if args.MCD_activated:
             log["discrepancy_src"] = stats["dis_s"] / nb
             log["discrepancy_trg"] = stats["dis"] / nb
+            log["discrepancy_ratio"] = stats["dis"]/ nb / (stats["dis_s"]/ nb + 1e-8)
             log["variance_penalty"] = stats["vpen"] / nb
         if pseudo_iter is not None:
             log["mse_pseudo"] = stats["st"] / n
@@ -554,13 +567,13 @@ def parse_args():
 
     # paths
     p.add_argument("--data_dict_path", type=str, default="Tierdaten/")
-    p.add_argument("--target_x_dict", type=str, default="X_anim1.csv")
-    p.add_argument("--target_y_dict", type=str, default="Y_anim1.csv")
-    p.add_argument("--source_x_dicts", type=str, default="X_anim10.csv,X_anim3.csv,X_anim4.csv,X_anim8.csv")
-    p.add_argument("--source_y_dicts", type=str, default="Y_anim10.csv,Y_anim3.csv,Y_anim4.csv,Y_anim8.csv")
+    p.add_argument("--target_x_dict", type=str, default="X_anim3.csv")
+    p.add_argument("--target_y_dict", type=str, default="Y_anim3.csv")
+    p.add_argument("--source_x_dicts", type=str, default="X_anim10.csv,X_anim4.csv,X_anim8.csv,X_anim1.csv")
+    p.add_argument("--source_y_dicts", type=str, default="Y_anim10.csv,Y_anim4.csv,Y_anim8.csv,Y_anim1.csv")
 
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training")
+    p.add_argument("--warmup_epochs", type=int, default=80, help="source-only training")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
@@ -577,9 +590,9 @@ def parse_args():
     p.add_argument("--pi_max_per_domain", type=int, default=2000)
 
     #MCD
-    p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
-    p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
-    p.add_argument("--num_k", type=int, default=4,
+    p.add_argument("--eta", type=float, default=0.5, help="discrepancy weight")
+    p.add_argument("--gamma", type=float, default=0.0, help="variance penalty weight")
+    p.add_argument("--num_k", type=int, default=1,
                    help="generator updates per batch in Step C (MCD's num_k)")
 
     # self-training
@@ -625,6 +638,9 @@ def main():
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
     combinations = [dict(zip(keys, v)) for v in allowed_values]
 
+    total_runs = len(combinations) * len(animal_pool) * len(seeds)
+    run_idx = 0
+
     for idx, config in enumerate(combinations, 1):
         args.MCD_activated = config["MCD_activated"]
         args.DRT_activated = config["DRT_activated"]
@@ -634,6 +650,12 @@ def main():
         all_target_r2_means = []
         all_target_r2_raw_means = []
         all_target_corr_means = []
+
+        # gammas = [0.005]
+        #
+        # for g in range(len(gammas)):
+        #
+        #     args.gamma = gammas[g]
 
         with mlflow.start_run(run_name=f"mcd_{int(args.MCD_activated)}"
                                        f"_drt{int(args.DRT_activated)}"
@@ -655,9 +677,6 @@ def main():
                 args.source_y_dicts = sources_y_str
 
                 seed_r2, seed_corr, seed_r2_raw = [], [], []
-
-                total_runs = len(combinations) * len(animal_pool) * len(seeds)
-                run_idx = 0
 
                 for i in range(len(seeds)):
                     args.seed = seeds[i]
@@ -687,6 +706,8 @@ def main():
                 all_target_r2_raw_means.append(mean_raw_r2)
                 all_target_corr_means.append(mean_corr)
                 print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
+
+                # break # for only 1
 
             mlflow.log_metrics({"mean_R2": float(np.mean(all_target_r2_means)),
                                 "mean_raw_R2": float(np.mean(all_target_r2_raw_means)),
