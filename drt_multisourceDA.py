@@ -11,6 +11,7 @@ import os
 from scipy.stats import pearsonr
 import mlflow
 from drt_pi import dump_pi
+from shap_analysis import run_shap_for_fold
 
 def set_seed(seed):
     """
@@ -510,10 +511,10 @@ def train(args):
             Xp, Yp, keep_rate, thr = make_pseudo_labels(
                 G, F1, F2, trg_train_X, device, args.st_keep_quantile)
 
-            mlflow.log_metrics({"st_keep_rate": keep_rate,
-                                "st_threshold": thr,
-                                "st_n_pseudo": float(len(Xp))},
-                               step=args.epochs)
+            # mlflow.log_metrics({"st_keep_rate": keep_rate,
+            #                     "st_threshold": thr,
+            #                     "st_n_pseudo": float(len(Xp))},
+            #                    step=args.epochs)
             print(f"  [ST] kept {keep_rate:.1%} of target samples "
                   f"({len(Xp)} pseudo-labelled, thr={thr:.4f})")
 
@@ -537,6 +538,27 @@ def train(args):
             else:
                 print(f"  [ST] skipped: only {len(Xp)} samples kept, "
                       f"need > {args.batch_size}")
+
+
+        # ---- post-hoc SHAP (one seed only; ~410k forward rows per beat) ----
+        if args.shap and args.seed == args.shap_seed:
+            names = (args.feature_names.split(",") if args.feature_names
+                     else [f"f{i}" for i in range(args.input_dim)])
+            run_shap_for_fold(
+                G, F1, F2,
+                X_background=trg_train_X,   # variation within this animal
+                X_explain=trg_val_X,        # the same split evaluate() scores
+                feature_names=names,
+                out_dir=args.shap_dir,
+                fold=args.target_x_dict.replace("X_", "").replace(".csv", ""),
+                seed=args.seed,
+                config=f"mcd{int(args.MCD_activated)}drt{int(args.DRT_activated)}st{int(args.ST_activated)}",
+                device=device, mlflow=mlflow,
+                targets=("mean", "disc_bounded"),
+                n_background=args.shap_background,
+                n_explain=args.shap_n,
+                y_std=float(normalizer.Y_std),
+            )
 
         #dump Pi
         if args.pi_dump_dir and args.DRT_activated:
@@ -590,8 +612,8 @@ def parse_args():
     p.add_argument("--pi_max_per_domain", type=int, default=2000)
 
     #MCD
-    p.add_argument("--eta", type=float, default=0.5, help="discrepancy weight")
-    p.add_argument("--gamma", type=float, default=0.0, help="variance penalty weight")
+    p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
+    p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
     p.add_argument("--num_k", type=int, default=1,
                    help="generator updates per batch in Step C (MCD's num_k)")
 
@@ -606,7 +628,13 @@ def parse_args():
     p.add_argument("--DRT_activated", type=bool, default=False)
     p.add_argument("--ST_activated", type=bool, default=False)
 
-
+    # SHAP
+    p.add_argument("--shap", action="store_true", help="post-hoc KernelSHAP after training")
+    p.add_argument("--shap_dir", type=str, default="shap_dumps")
+    p.add_argument("--shap_n", type=int, default=100, help="target beats to explain")
+    p.add_argument("--shap_background", type=int, default=25, help="k-means centroids")
+    p.add_argument("--shap_seed", type=int, default=100, help="only this seed gets SHAP")
+    p.add_argument("--feature_names", type=str, default="", help="comma-separated, 14 names")
 
     return p.parse_args()
 
