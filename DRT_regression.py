@@ -686,7 +686,7 @@ def train(args, run_name=None):
 def parse_args():
     p = argparse.ArgumentParser(description="DRT for tabular regression")
     p.add_argument("--data_dict_path", type=str,
-                   default="C:/Users/leona/PythonScripts/MasterThesis/Tierdaten/")
+                   default="Tierdaten/")
     p.add_argument("--target_x_dict", type=str, default="X_anim1.csv")
     p.add_argument("--target_y_dict", type=str, default="Y_anim1.csv")
     p.add_argument("--source_x_dicts", type=str,
@@ -696,13 +696,13 @@ def parse_args():
 
     # optimisation
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=60)
+    p.add_argument("--warmup_epochs", type=int, default=80)
     p.add_argument("--da_ramp", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--lr_f", type=float, default=0.005)
     p.add_argument("--weight_decay", type=float, default=5e-4)
-    p.add_argument("--schedule", type=int, nargs="+", default=[100, 125, 140])
+    p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--val_ratio", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=100)
 

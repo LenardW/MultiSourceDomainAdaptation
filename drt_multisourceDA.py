@@ -12,6 +12,7 @@ from scipy.stats import pearsonr
 import mlflow
 from drt_pi import dump_pi
 from shap_analysis import run_shap_for_fold
+from plots import plot_fold
 
 def set_seed(seed):
     """
@@ -560,6 +561,23 @@ def train(args):
                 y_std=float(normalizer.Y_std),
             )
 
+        # ---- actual vs predicted + residuals over time (one seed only) ----
+        if args.seed == args.shap_seed:
+            fold = args.target_x_dict.replace("X_", "").replace(".csv", "")
+            cfg = (f"mcd{int(args.MCD_activated)}drt{int(args.DRT_activated)}"
+                   f"st{int(args.ST_activated)}")
+            os.makedirs("pred_plots", exist_ok=True)
+            plot_fold(
+                G, F1, F2,
+                X=target_X_n,            # full animal, unshuffled -> row order = time
+                y=target_Y_n,            # normalized; plot_fold de-normalizes
+                animal_id=fold,
+                y_mean=float(normalizer.Y_mean),
+                y_std=float(normalizer.Y_std),
+                device=device,
+                out_path=f"pred_plots/{cfg}_{fold}_seed{args.seed}.png",
+            )
+
         #dump Pi
         if args.pi_dump_dir and args.DRT_activated:
             names = [args.target_x_dict] + args.source_x_dicts.split(",")
@@ -589,13 +607,13 @@ def parse_args():
 
     # paths
     p.add_argument("--data_dict_path", type=str, default="Tierdaten/")
-    p.add_argument("--target_x_dict", type=str, default="X_anim3.csv")
-    p.add_argument("--target_y_dict", type=str, default="Y_anim3.csv")
-    p.add_argument("--source_x_dicts", type=str, default="X_anim10.csv,X_anim4.csv,X_anim8.csv,X_anim1.csv")
-    p.add_argument("--source_y_dicts", type=str, default="Y_anim10.csv,Y_anim4.csv,Y_anim8.csv,Y_anim1.csv")
+    p.add_argument("--target_x_dict", type=str, default="X_anim1.csv")
+    p.add_argument("--target_y_dict", type=str, default="Y_anim1.csv")
+    p.add_argument("--source_x_dicts", type=str, default="X_anim3.csv,X_anim4.csv,X_anim8.csv,X_anim10.csv")
+    p.add_argument("--source_y_dicts", type=str, default="Y_anim3.csv,Y_anim4.csv,Y_anim8.csv,Y_anim10.csv")
 
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=80, help="source-only training")
+    p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
@@ -629,7 +647,7 @@ def parse_args():
     p.add_argument("--ST_activated", type=bool, default=False)
 
     # SHAP
-    p.add_argument("--shap", action="store_true", help="post-hoc KernelSHAP after training")
+    p.add_argument("--shap", type=bool, default=False, help="post-hoc KernelSHAP after training")
     p.add_argument("--shap_dir", type=str, default="shap_dumps")
     p.add_argument("--shap_n", type=int, default=100, help="target beats to explain")
     p.add_argument("--shap_background", type=int, default=25, help="k-means centroids")
@@ -655,11 +673,12 @@ def main():
 
     animal_pool = list(zip(x_dicts, y_dicts))
 
+    # MCD DRT ST
     allowed_values = [
         # (False, False, False),
         # (False, True, False),
-        (True, False, False),
-        # (True, True, False),
+        # (True, False, False),
+        (True, True, False),
         # (True, True, True)
     ]
 
@@ -679,11 +698,11 @@ def main():
         all_target_r2_raw_means = []
         all_target_corr_means = []
 
-        # gammas = [0.005]
+        # ks = [2,4,8,16]
         #
-        # for g in range(len(gammas)):
+        # for k in range(len(ks)):
         #
-        #     args.gamma = gammas[g]
+        #     args.K = ks[k]
 
         with mlflow.start_run(run_name=f"mcd_{int(args.MCD_activated)}"
                                        f"_drt{int(args.DRT_activated)}"
@@ -735,7 +754,7 @@ def main():
                 all_target_corr_means.append(mean_corr)
                 print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
 
-                # break # for only 1
+                # break # for only 1 anim
 
             mlflow.log_metrics({"mean_R2": float(np.mean(all_target_r2_means)),
                                 "mean_raw_R2": float(np.mean(all_target_r2_raw_means)),

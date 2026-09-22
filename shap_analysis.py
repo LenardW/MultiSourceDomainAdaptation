@@ -315,10 +315,10 @@ if __name__ == "__main__":
     ap.add_argument("--dir", default="shap_dumps")
     ap.add_argument("--target", default="mean",
                     help="mean | disc_bounded | disc_abs | head1 | head2")
-    ap.add_argument("--config", default=None,
+    ap.add_argument("--config", default= "mcd1drt1st0",
                     help="e.g. mcd1drt0st0 -- required if several configs are present")
     ap.add_argument("--seed", default=None)
-    ap.add_argument("--physical", action="store_true",
+    ap.add_argument("--physical", type=bool, default=True,
                     help="rescale to strokework units using each fold's Y_std")
     a = ap.parse_args()
     report(a.dir, a.target, a.config, a.seed, a.physical)
