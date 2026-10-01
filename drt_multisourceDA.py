@@ -675,11 +675,11 @@ def main():
 
     # MCD DRT ST
     allowed_values = [
-        # (False, False, False),
-        # (False, True, False),
-        # (True, False, False),
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
         (True, True, False),
-        # (True, True, True)
+        (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
@@ -697,12 +697,6 @@ def main():
         all_target_r2_means = []
         all_target_r2_raw_means = []
         all_target_corr_means = []
-
-        # ks = [2,4,8,16]
-        #
-        # for k in range(len(ks)):
-        #
-        #     args.K = ks[k]
 
         with mlflow.start_run(run_name=f"mcd_{int(args.MCD_activated)}"
                                        f"_drt{int(args.DRT_activated)}"
@@ -740,6 +734,8 @@ def main():
                     seed_r2_raw.append(run_r2)
                     seed_corr.append(run_corr)
 
+                    # break # only first seed
+
                 mean_r2 = np.mean(seed_r2)
                 std_r2 = np.std(seed_r2, ddof=1) # sample std
                 mean_raw_r2 = np.mean(seed_r2_raw)
@@ -754,7 +750,7 @@ def main():
                 all_target_corr_means.append(mean_corr)
                 print(f"Finished Target {target_name}! Result: {mean_r2:.4f} ± {std_r2:.4f}")
 
-                # break # for only 1 anim
+                # break # only first animal
 
             mlflow.log_metrics({"mean_R2": float(np.mean(all_target_r2_means)),
                                 "mean_raw_R2": float(np.mean(all_target_r2_raw_means)),
