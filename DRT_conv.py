@@ -692,10 +692,10 @@ def parse_args():
     p.add_argument("--pi_max_per_domain", type=int, default=2000)
 
     # temporal convolution
-    p.add_argument("--window", type=int, default=5,
+    p.add_argument("--window", type=int, default=7,
                    help="beats per window; >= receptive field 1+2*(kernel_size-1)")
     p.add_argument("--kernel_size", type=int, default=3, help="temporal width of W_0")
-    p.add_argument("--phi_kernel", type=int, default=3,
+    p.add_argument("--phi_kernel", type=int, default=2,
                    help="temporal width of the bases Phi_i (released code: 1)")
     p.add_argument("--val_split", type=str, default="random", choices=["random", "block"],
                    help="target train/val split of the windows")

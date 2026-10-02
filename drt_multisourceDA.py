@@ -146,10 +146,10 @@ class DynamicLinear(nn.Module):
 class DynamicBackbone(nn.Module):
     def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True, basis_scale=0.1):
         super().__init__()
-        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
-        self.bn1, self.relu1 = nn.BatchNorm1d(256), nn.ReLU()
+        self.layer1 = DynamicLinear(in_dim, 128, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
+        self.bn1, self.relu1 = nn.BatchNorm1d(128), nn.ReLU()
 
-        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
+        self.layer2 = DynamicLinear(128, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
         self.bn2, self.relu2 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
 
     def forward(self, x):
@@ -230,17 +230,11 @@ def basis_similarity(layer):
 @torch.no_grad()
 def make_pseudo_labels(G, F1, F2, X_trg, device, keep_quantile):
     """
-    One-shot pseudo-labelling of the unlabelled target split.
-
-    The paper runs self-training as a *second training round* after DRT has
-    converged, not as an online per-batch step: pseudo-labels above a
-    confidence threshold are used to train DRT again together with source
-    samples. Regression has no softmax confidence, so head agreement stands in
-    for it -- which is also the quantity MCD already optimises, making it the
-    natural confidence proxy here.
-
-    The threshold is a quantile of the observed discrepancy rather than an
-    absolute number, so the keep rate is stable across animals and scales.
+    one-shot pseudo-labelling of the unlabelled target split
+    pseudo-labels above a confidence threshold are used to train DRT
+    again together with source samples
+    uses head agreement instead of softmax confidence
+    threshold is a quantile of the observed discrepancy
     """
     G.eval(); F1.eval(); F2.eval()
     Xt = torch.tensor(X_trg, dtype=torch.float32).to(device)
@@ -251,20 +245,21 @@ def make_pseudo_labels(G, F1, F2, X_trg, device, keep_quantile):
         p1s.append(F1(feat)); p2s.append(F2(feat))
     p1, p2 = torch.cat(p1s), torch.cat(p2s)
 
-    pseudo = ((p1 + p2) / 2.0).cpu().numpy()
-    disc = torch.abs(p1 - p2).cpu().numpy()
-    thr = float(np.quantile(disc, keep_quantile))
+    pseudo = ((p1 + p2) / 2.0).cpu().numpy() # average of heads
+    disc = torch.abs(p1 - p2).cpu().numpy() # discrepancy of heads
+    thr = float(np.quantile(disc, keep_quantile)) #threshold -> quantile of discrepancies
     keep = disc <= thr
     return X_trg[keep], pseudo[keep], float(keep.mean()), thr
 
 def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
               val_loader, normalizer, device, args, n_epochs, epoch_offset,
               phase, pseudo_loader=None):
-    """One training phase.
+    """
+    Training Phase
 
-    Metric names are identical in both phases and the epoch counter continues
-    across them, so every MLflow curve is continuous over the whole run; the
-    `phase` metric marks where the self-training round starts.
+    identical metric names in all phases as well as epoch counter
+    metric phase marks beginn self-training
+
     """
     metrics = None
     trg_iter = iter(trg_loader) if args.MCD_activated else None
@@ -276,9 +271,11 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
         G.train(); F1.train(); F2.train()
 
         # Discrepancy warmup factor
+        # warmup_epochs -> epoch until MCD activated
         if gstep <= args.warmup_epochs:
             da_weight = 0.0
         else:
+            # slowly build up epochs
             da_weight = min(1.0, (gstep - args.warmup_epochs) / 20.0)
 
         stats = {"mse1": 0.0, "mse2": 0.0, "st": 0.0, "dis": 0.0,
@@ -512,18 +509,14 @@ def train(args):
             Xp, Yp, keep_rate, thr = make_pseudo_labels(
                 G, F1, F2, trg_train_X, device, args.st_keep_quantile)
 
-            # mlflow.log_metrics({"st_keep_rate": keep_rate,
-            #                     "st_threshold": thr,
-            #                     "st_n_pseudo": float(len(Xp))},
-            #                    step=args.epochs)
             print(f"  [ST] kept {keep_rate:.1%} of target samples "
                   f"({len(Xp)} pseudo-labelled, thr={thr:.4f})")
 
             if len(Xp) > args.batch_size:
                 pseudo_loader = make_loader(Xp, Yp, args.batch_size)
 
-                # Lower learning rate for the refinement round, and a fresh
-                # scheduler with no milestones so it stays constant.
+                # lower learning rate
+                # new scheduler with no milestones to stays constant
                 for g in opt_g.param_groups:
                     g["lr"] = args.lr * args.st_lr_scale
                 for g in opt_f.param_groups:
@@ -540,8 +533,10 @@ def train(args):
                 print(f"  [ST] skipped: only {len(Xp)} samples kept, "
                       f"need > {args.batch_size}")
 
-
-        # ---- post-hoc SHAP (one seed only; ~410k forward rows per beat) ----
+        # --------------------------
+        # optional post-hoc analysis
+        # --------------------------
+        # one seed SHAP Values
         if args.shap and args.seed == args.shap_seed:
             names = (args.feature_names.split(",") if args.feature_names
                      else [f"f{i}" for i in range(args.input_dim)])
@@ -561,7 +556,7 @@ def train(args):
                 y_std=float(normalizer.Y_std),
             )
 
-        # ---- actual vs predicted + residuals over time (one seed only) ----
+        # residual plots
         if args.seed == args.shap_seed:
             fold = args.target_x_dict.replace("X_", "").replace(".csv", "")
             cfg = (f"mcd{int(args.MCD_activated)}drt{int(args.DRT_activated)}"
@@ -578,7 +573,7 @@ def train(args):
                 out_path=f"pred_plots/{cfg}_{fold}_seed{args.seed}.png",
             )
 
-        #dump Pi
+        #PIs for t-sne
         if args.pi_dump_dir and args.DRT_activated:
             names = [args.target_x_dict] + args.source_x_dicts.split(",")
             names = [n.replace("X_", "").replace(".csv", "") for n in names]
@@ -619,7 +614,7 @@ def parse_args():
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
 
     p.add_argument("--input_dim", type=int, default=14)
-    p.add_argument("--hidden_dim", type=int, default=128)
+    p.add_argument("--hidden_dim", type=int, default=64)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
 
@@ -676,10 +671,10 @@ def main():
     # MCD DRT ST
     allowed_values = [
         (False, False, False),
-        (False, True, False),
+        # (False, True, False),
         (True, False, False),
-        (True, True, False),
-        (True, True, True)
+        # (True, True, False),
+        # (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
