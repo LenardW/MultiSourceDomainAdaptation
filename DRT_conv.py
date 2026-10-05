@@ -182,17 +182,21 @@ class DynamicBackbone(nn.Module):
         super().__init__()
         kw = dict(K=K, drt_activated=drt_activated, basis_scale=basis_scale,
                   kernel_size=kernel_size, phi_kernel=phi_kernel)
-        self.receptive_field = 1 + 2 * (kernel_size - 1)
+        self.receptive_field = 1 + 3 * (kernel_size - 1)
 
-        self.layer1 = DynamicConv1d(in_dim, 128, **kw)
-        self.bn1, self.relu1 = nn.BatchNorm1d(128), nn.ReLU()
+        self.layer1 = DynamicConv1d(in_dim, 256, **kw)
+        self.bn1, self.relu1 = nn.BatchNorm1d(256), nn.ReLU()
 
-        self.layer2 = DynamicConv1d(128, hidden_dim, **kw)
+        self.layer2 = DynamicConv1d(256, hidden_dim, **kw)
         self.bn2, self.relu2 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
+
+        self.layer3 = DynamicConv1d(hidden_dim, hidden_dim, **kw)
+        self.bn3, self.relu3 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
 
     def forward(self, x):                                  # x: [B, C_in, L]
         h = self.relu1(self.bn1(self.layer1(x)))           # [B, 256, L-k+1]
         h = self.relu2(self.bn2(self.layer2(h)))           # [B, hidden, L-2k+2]
+        h = self.relu3(self.bn3(self.layer3(h)))
         return h[..., -1]                                  # last beat -> [B, hidden]
 
 class FlatWindow(nn.Module):
@@ -681,7 +685,7 @@ def parse_args():
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
 
     p.add_argument("--input_dim", type=int, default=14)
-    p.add_argument("--hidden_dim", type=int, default=64)
+    p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
 

@@ -146,10 +146,10 @@ class DynamicLinear(nn.Module):
 class DynamicBackbone(nn.Module):
     def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True, basis_scale=0.1):
         super().__init__()
-        self.layer1 = DynamicLinear(in_dim, 128, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
-        self.bn1, self.relu1 = nn.BatchNorm1d(128), nn.ReLU()
+        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
+        self.bn1, self.relu1 = nn.BatchNorm1d(256), nn.ReLU()
 
-        self.layer2 = DynamicLinear(128, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
+        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
         self.bn2, self.relu2 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
 
     def forward(self, x):
@@ -182,7 +182,6 @@ def variance_penalty(pred1, pred2):
 @torch.no_grad()
 def evaluate(G, F1, F2, loader, device, normalizer):
     G.eval()
-    #Router.eval()
     F1.eval()
     F2.eval()
 
@@ -191,7 +190,6 @@ def evaluate(G, F1, F2, loader, device, normalizer):
     for X_b, Y_b in loader:
         X_b, Y_b = X_b.to(device), Y_b.to(device)
         feat = G(X_b)
-        #sub1, sub2 = Router(feat)
         # ensemble: average of the two heads
         pred = (F1(feat) + F2(feat)) / 2.0
         preds.append(pred.cpu())
@@ -293,7 +291,7 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
                     X_t, _ = next(trg_iter)
                 X_t = X_t.to(device)
 
-            # ---- Step A: supervised risk, plus pseudo-labelled target ----
+            # Step A also used for non MCD
             for p in G.parameters():
                 p.requires_grad = True
             for p in head_params:
@@ -304,14 +302,15 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
             loss_s2 = F.mse_loss(F2(feat_s), Y_s)
             loss_stepA = loss_s1 + loss_s2
 
-            # Pseudo-labelled target samples join the source loss, as the paper
-            # describes: "used to train DRT again with source samples".
+            # Pseudo-labelled target samples join the source loss
+
             if pseudo_iter is not None:
                 try:
                     Xp, Yp = next(pseudo_iter)
                 except StopIteration:
                     pseudo_iter = iter(pseudo_loader)
                     Xp, Yp = next(pseudo_iter)
+
                 if Xp.size(0) > 1:
                     Xp, Yp = Xp.to(device), Yp.to(device)
                     feat_p = G(Xp)
@@ -324,13 +323,13 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
             loss_stepA.backward()
             opt_g.step(); opt_f.step()
 
-            # Accumulated here, before Step B reassigns the source losses.
+            # stats
             stats["mse1"] += loss_s1.item() * bsz
             stats["mse2"] += loss_s2.item() * bsz
             stats["n"] += bsz
             stats["nb"] += 1
 
-            # ---- Steps B and C: MCD only ----
+            # Steps B and C of MCD
             if args.MCD_activated:
                 # Step B: heads maximise target discrepancy, backbone frozen.
                 for p in G.parameters():
@@ -609,7 +608,7 @@ def parse_args():
 
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training")
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
 
@@ -671,10 +670,10 @@ def main():
     # MCD DRT ST
     allowed_values = [
         (False, False, False),
-        # (False, True, False),
+        (False, True, False),
         (True, False, False),
-        # (True, True, False),
-        # (True, True, True)
+        (True, True, False),
+        (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
