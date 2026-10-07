@@ -169,6 +169,33 @@ class RegressorHead(nn.Module):
     def forward(self, feat):
         return self.net(feat).squeeze(-1)
 
+class MeanHead(nn.Module):
+    """Averages several heads into one callable head.
+
+    Only used so that tools expecting a single (F1, F2) pair -- SHAP, the
+    prediction plots -- keep working in `pairs` mode, where there is one head
+    pair per source animal.
+    """
+    def __init__(self, heads):
+        super().__init__()
+        self.heads = nn.ModuleList(heads)
+
+    def forward(self, feat):
+        return torch.stack([h(feat) for h in self.heads], 0).mean(0)
+
+def flat_heads(heads):
+    """[(F1, F2), ...] -> flat list of every head."""
+    return [h for pair in heads for h in pair]
+
+def ensemble(heads, feat):
+    """Prediction of the full ensemble: mean over every head of every pair."""
+    return torch.stack([h(feat) for h in flat_heads(heads)], 0).mean(0)
+
+def mean_discrepancy(heads, feat):
+    """Mean over pairs of the within-pair discrepancy."""
+    return sum(discrepancy_loss(F1(feat), F2(feat))
+               for F1, F2 in heads) / len(heads)
+
 def discrepancy_loss(pred1, pred2):
     return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
 # def discrepancy_loss(pred1, pred2, kind="bounded"):
@@ -180,18 +207,19 @@ def variance_penalty(pred1, pred2):
 
 
 @torch.no_grad()
-def evaluate(G, F1, F2, loader, device, normalizer):
+def evaluate(G, heads, loader, device, normalizer):
     G.eval()
-    F1.eval()
-    F2.eval()
+    for h in flat_heads(heads):
+        h.eval()
 
     preds, targets = [], []
 
     for X_b, Y_b in loader:
         X_b, Y_b = X_b.to(device), Y_b.to(device)
         feat = G(X_b)
-        # ensemble: average of the two heads
-        pred = (F1(feat) + F2(feat)) / 2.0
+        # ensemble: average over every head (2 in combine/balanced mode,
+        # 2 per source animal in pairs mode)
+        pred = ensemble(heads, feat)
         preds.append(pred.cpu())
         targets.append(Y_b.cpu())
 
@@ -226,7 +254,7 @@ def basis_similarity(layer):
     return float(off.mean())
 
 @torch.no_grad()
-def make_pseudo_labels(G, F1, F2, X_trg, device, keep_quantile):
+def make_pseudo_labels(G, heads, X_trg, device, keep_quantile):
     """
     one-shot pseudo-labelling of the unlabelled target split
     pseudo-labels above a confidence threshold are used to train DRT
@@ -234,88 +262,124 @@ def make_pseudo_labels(G, F1, F2, X_trg, device, keep_quantile):
     uses head agreement instead of softmax confidence
     threshold is a quantile of the observed discrepancy
     """
-    G.eval(); F1.eval(); F2.eval()
+    G.eval()
+    for h in flat_heads(heads):
+        h.eval()
     Xt = torch.tensor(X_trg, dtype=torch.float32).to(device)
 
-    p1s, p2s = [], []
+    means, discs = [], []
     for i in range(0, len(Xt), 512):
         feat = G(Xt[i:i + 512])
-        p1s.append(F1(feat)); p2s.append(F2(feat))
-    p1, p2 = torch.cat(p1s), torch.cat(p2s)
+        means.append(ensemble(heads, feat))
+        # confidence: mean within-pair disagreement over all pairs
+        discs.append(torch.stack([torch.abs(F1(feat) - F2(feat))
+                                  for F1, F2 in heads], 0).mean(0))
 
-    pseudo = ((p1 + p2) / 2.0).cpu().numpy() # average of heads
-    disc = torch.abs(p1 - p2).cpu().numpy() # discrepancy of heads
-    thr = float(np.quantile(disc, keep_quantile)) #threshold -> quantile of discrepancies
+    pseudo = torch.cat(means).cpu().numpy()
+    disc = torch.cat(discs).cpu().numpy()
+    thr = float(np.quantile(disc, keep_quantile))
     keep = disc <= thr
     return X_trg[keep], pseudo[keep], float(keep.mean()), thr
 
-def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
+def next_batch(it, loader):
+    """Next batch from a cycling iterator; returns the batch and the iterator."""
+    try:
+        return next(it), it
+    except StopIteration:
+        it = iter(loader)
+        return next(it), it
+
+def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
               val_loader, normalizer, device, args, n_epochs, epoch_offset,
               phase, pseudo_loader=None):
     """
     Training Phase
 
+    `src_loaders` holds one loader per source animal in balanced/pairs mode and
+    a single pooled loader in combine mode. The epoch is driven by the longest
+    source loader; shorter animals are cycled, so every animal contributes the
+    same number of samples per step regardless of recording length.
+
     identical metric names in all phases as well as epoch counter
     metric phase marks beginn self-training
-
     """
     metrics = None
     trg_iter = iter(trg_loader) if args.MCD_activated else None
     pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
-    head_params = list(F1.parameters()) + list(F2.parameters())
+    head_params = [p for h in flat_heads(heads) for p in h.parameters()]
+
+    # pairs mode: one head pair per source animal, so each pair sees only its
+    # own animal in Step A. Otherwise the single pair sees every animal.
+    paired = len(heads) == len(src_loaders) and len(heads) > 1
+
+    steps_per_epoch = max(len(l) for l in src_loaders)
 
     for epoch in range(1, n_epochs + 1):
         gstep = epoch_offset + epoch
-        G.train(); F1.train(); F2.train()
+        G.train()
+        for h in flat_heads(heads):
+            h.train()
 
         # Discrepancy warmup factor
-        # warmup_epochs -> epoch until MCD activated
         if gstep <= args.warmup_epochs:
             da_weight = 0.0
         else:
-            # slowly build up epochs
             da_weight = min(1.0, (gstep - args.warmup_epochs) / 20.0)
 
         stats = {"mse1": 0.0, "mse2": 0.0, "st": 0.0, "dis": 0.0,
                  "dis_s": 0.0, "vpen": 0.0, "n": 0, "nb": 0}
 
-        for X_s, Y_s in src_loader:
-            bsz = X_s.size(0)
-            X_s, Y_s = X_s.to(device), Y_s.to(device)
+        src_iters = [iter(l) for l in src_loaders]
+
+        for _ in range(steps_per_epoch):
+            xs, ys = [], []
+            for i, loader in enumerate(src_loaders):
+                (X_i, Y_i), src_iters[i] = next_batch(src_iters[i], loader)
+                xs.append(X_i.to(device)); ys.append(Y_i.to(device))
+            bsz = sum(x.size(0) for x in xs)
+            sizes = [x.size(0) for x in xs]
 
             if args.MCD_activated:
-                try:
-                    X_t, _ = next(trg_iter)
-                except StopIteration:
-                    trg_iter = iter(trg_loader)
-                    X_t, _ = next(trg_iter)
+                (X_t, _), trg_iter = next_batch(trg_iter, trg_loader)
                 X_t = X_t.to(device)
 
-            # Step A also used for non MCD
+            # ---- Step A: supervised risk, plus pseudo-labelled target ----
             for p in G.parameters():
                 p.requires_grad = True
             for p in head_params:
                 p.requires_grad = True
 
-            feat_s = G(X_s)
-            loss_s1 = F.mse_loss(F1(feat_s), Y_s)
-            loss_s2 = F.mse_loss(F2(feat_s), Y_s)
+            # ONE forward pass over all animals: separate passes would give each
+            # animal its own BatchNorm statistics, i.e. unintended per-domain
+            # normalisation.
+            feats = torch.split(G(torch.cat(xs, 0)), sizes)
+
+            if paired:
+                # each pair is trained only on its own animal, which is what
+                # makes the pairs genuinely different (M3SDA-beta's structure)
+                l1 = sum(F.mse_loss(hp[0](f), y)
+                         for hp, f, y in zip(heads, feats, ys)) / len(heads)
+                l2 = sum(F.mse_loss(hp[1](f), y)
+                         for hp, f, y in zip(heads, feats, ys)) / len(heads)
+            else:
+                # the single pair sees every animal; mean over animals rather
+                # than over pooled samples, so a long recording cannot dominate
+                F1, F2 = heads[0]
+                l1 = sum(F.mse_loss(F1(f), y) for f, y in zip(feats, ys)) / len(feats)
+                l2 = sum(F.mse_loss(F2(f), y) for f, y in zip(feats, ys)) / len(feats)
+
+            loss_s1, loss_s2 = l1, l2
             loss_stepA = loss_s1 + loss_s2
 
-            # Pseudo-labelled target samples join the source loss
-
+            # Pseudo-labelled target samples join the source loss, as the paper
+            # describes: "used to train DRT again with source samples".
             if pseudo_iter is not None:
-                try:
-                    Xp, Yp = next(pseudo_iter)
-                except StopIteration:
-                    pseudo_iter = iter(pseudo_loader)
-                    Xp, Yp = next(pseudo_iter)
-
+                (Xp, Yp), pseudo_iter = next_batch(pseudo_iter, pseudo_loader)
                 if Xp.size(0) > 1:
                     Xp, Yp = Xp.to(device), Yp.to(device)
                     feat_p = G(Xp)
-                    l_st = (F.mse_loss(F1(feat_p), Yp)
-                            + F.mse_loss(F2(feat_p), Yp))
+                    l_st = sum(F.mse_loss(h(feat_p), Yp)
+                               for h in flat_heads(heads)) / len(heads)
                     loss_stepA = loss_stepA + args.st_weight * l_st
                     stats["st"] += float(l_st) * bsz
 
@@ -323,13 +387,13 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
             loss_stepA.backward()
             opt_g.step(); opt_f.step()
 
-            # stats
+            # Accumulated here, before Step B reassigns the source losses.
             stats["mse1"] += loss_s1.item() * bsz
             stats["mse2"] += loss_s2.item() * bsz
             stats["n"] += bsz
             stats["nb"] += 1
 
-            # Steps B and C of MCD
+            # ---- Steps B and C: MCD only ----
             if args.MCD_activated:
                 # Step B: heads maximise target discrepancy, backbone frozen.
                 for p in G.parameters():
@@ -337,25 +401,28 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
                 for p in head_params:
                     p.requires_grad = True
 
-                feat_s_d = G(X_s).detach()
+                feats_d = [f.detach() for f in
+                           torch.split(G(torch.cat(xs, 0)), sizes)]
                 feat_t_d = G(X_t).detach()
 
-                pred_s1, pred_s2 = F1(feat_s_d), F2(feat_s_d)
-                pred_t1, pred_t2 = F1(feat_t_d), F2(feat_t_d)
+                if paired:
+                    src_term = sum(
+                        F.mse_loss(hp[0](f), y) + F.mse_loss(hp[1](f), y)
+                        for hp, f, y in zip(heads, feats_d, ys)) / len(heads)
+                else:
+                    F1, F2 = heads[0]
+                    src_term = sum(F.mse_loss(F1(f), y) + F.mse_loss(F2(f), y)
+                                   for f, y in zip(feats_d, ys)) / len(feats_d)
 
-                dis = discrepancy_loss(pred_t1, pred_t2)
-                vpen = variance_penalty(pred_t1, pred_t2)
-
-                # stats["dis_s"] += float(discrepancy_loss(pred_s1, pred_s2).detach())
+                # every pair marks the support of its own animal; the generator
+                # must later pull the target inside all of them at once
+                dis = mean_discrepancy(heads, feat_t_d)
+                vpen = sum(variance_penalty(F1(feat_t_d), F2(feat_t_d))
+                           for F1, F2 in heads) / len(heads)
 
                 # Minimising a negative 'dis' term maximises the discrepancy
-                loss_stepB = (F.mse_loss(pred_s1, Y_s)
-                              + F.mse_loss(pred_s2, Y_s)
-                              + da_weight * (args.gamma * vpen
-                                             - args.eta * dis))
-                # loss_stepB = (F.mse_loss(pred_s1, Y_s)
-                #               + F.mse_loss(pred_s2, Y_s)
-                #               - da_weight * args.eta * dis)
+                loss_stepB = src_term + da_weight * (args.gamma * vpen
+                                                     - args.eta * dis)
 
                 opt_f.zero_grad()
                 loss_stepB.backward()
@@ -369,10 +436,9 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
 
                 for _ in range(args.num_k):
                     feat_t = G(X_t)
-                    pred_t1, pred_t2 = F1(feat_t), F2(feat_t)
-
-                    dis = discrepancy_loss(pred_t1, pred_t2)
-                    vpen = variance_penalty(pred_t1, pred_t2)
+                    dis = mean_discrepancy(heads, feat_t)
+                    vpen = sum(variance_penalty(F1(feat_t), F2(feat_t))
+                               for F1, F2 in heads) / len(heads)
 
                     # Minimising positive 'dis' pulls the target inside the boundary
                     loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
@@ -383,17 +449,19 @@ def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
 
                 G.eval()
                 with torch.no_grad():
-                    p1s, p2s = F1(G(X_s)), F2(G(X_s))
-                    p1t, p2t = F1(G(X_t)), F2(G(X_t))
-                    stats["dis_s"] += float(discrepancy_loss(p1s, p2s))
-                    stats["dis"]   += float(discrepancy_loss(p1t, p2t))
-                    stats["vpen"]  += float(variance_penalty(p1t, p2t))
+                    feat_s = G(torch.cat(xs, 0))
+                    feat_t = G(X_t)
+                    stats["dis_s"] += float(mean_discrepancy(heads, feat_s))
+                    stats["dis"]   += float(mean_discrepancy(heads, feat_t))
+                    stats["vpen"]  += float(
+                        sum(variance_penalty(F1(feat_t), F2(feat_t))
+                            for F1, F2 in heads) / len(heads))
                 G.train()
 
         sch_g.step(); sch_f.step()
 
         n, nb = max(stats["n"], 1), max(stats["nb"], 1)
-        mae, rmse, r2, corr = evaluate(G, F1, F2, val_loader, device, normalizer)
+        mae, rmse, r2, corr = evaluate(G, heads, val_loader, device, normalizer)
         metrics = (mae, rmse, r2, corr)
 
         log = {
@@ -465,7 +533,16 @@ def train(args):
         target_X_n, target_Y_n, val_ratio=0.2, seed=args.seed)
 
     # Dataloader trg_train_Y not used
-    src_loader = make_loader(X_src_n, Y_src_n, args.batch_size)
+    if args.ms_mode == "combine":
+        # single pooled source domain -- the setting the MCD paper describes
+        src_loaders = [make_loader(X_src_n, Y_src_n, args.batch_size)]
+    else:
+        # one loader per animal; the per-animal batch size keeps the total
+        # number of source samples per step at roughly args.batch_size
+        per = max(args.batch_size // len(source_domains), 2)
+        src_loaders = [make_loader(normalizer.transform_X(Xs),
+                                   normalizer.transform_Y(Ys), per)
+                       for Xs, Ys in source_domains]
     trg_loader = make_loader(trg_train_X, trg_train_Y, args.batch_size)
     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
                              shuffle=False, drop_last=False)
@@ -478,11 +555,15 @@ def train(args):
         basis_scale = args.basis_scale
     ).to(device)
 
-    F1 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
-    F2 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
+    # pairs: one head pair per source animal (M3SDA-beta's structure), so the
+    # pairs differ because the animals differ, not only because of the init
+    n_pairs = len(source_domains) if args.ms_mode == "pairs" else 1
+    heads = [(RegressorHead(hidden_dim=args.hidden_dim).to(device),
+              RegressorHead(hidden_dim=args.hidden_dim).to(device))
+             for _ in range(n_pairs)]
 
     opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
-    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),
+    opt_f = optim.SGD([p for h in flat_heads(heads) for p in h.parameters()],
                       lr=args.lr_f, momentum=0.9)
 
     sch_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule,
@@ -499,14 +580,14 @@ def train(args):
         mlflow.log_param("n_params_G", sum(p.numel() for p in G.parameters()))
 
         #Phase 1
-        metrics = run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f,
-                            src_loader, trg_loader, val_loader, normalizer,
+        metrics = run_phase(G, heads, opt_g, opt_f, sch_g, sch_f,
+                            src_loaders, trg_loader, val_loader, normalizer,
                             device, args, args.epochs, 0, phase=0)
 
         #Phase 2: self-training
         if args.ST_activated:
             Xp, Yp, keep_rate, thr = make_pseudo_labels(
-                G, F1, F2, trg_train_X, device, args.st_keep_quantile)
+                G, heads, trg_train_X, device, args.st_keep_quantile)
 
             print(f"  [ST] kept {keep_rate:.1%} of target samples "
                   f"({len(Xp)} pseudo-labelled, thr={thr:.4f})")
@@ -523,8 +604,8 @@ def train(args):
                 sch_g = optim.lr_scheduler.MultiStepLR(opt_g, [], gamma=0.1)
                 sch_f = optim.lr_scheduler.MultiStepLR(opt_f, [], gamma=0.1)
 
-                metrics = run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f,
-                                    src_loader, trg_loader, val_loader,
+                metrics = run_phase(G, heads, opt_g, opt_f, sch_g, sch_f,
+                                    src_loaders, trg_loader, val_loader,
                                     normalizer, device, args, args.st_epochs,
                                     args.epochs, phase=1,
                                     pseudo_loader=pseudo_loader)
@@ -532,10 +613,16 @@ def train(args):
                 print(f"  [ST] skipped: only {len(Xp)} samples kept, "
                       f"need > {args.batch_size}")
 
+
         # --------------------------
         # optional post-hoc analysis
         # --------------------------
         # one seed SHAP Values
+
+
+        F1 = MeanHead([h[0] for h in heads]).to(device)
+        F2 = MeanHead([h[1] for h in heads]).to(device)
+
         if args.shap and args.seed == args.shap_seed:
             names = (args.feature_names.split(",") if args.feature_names
                      else [f"f{i}" for i in range(args.input_dim)])
@@ -608,12 +695,12 @@ def parse_args():
 
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training")
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
 
     p.add_argument("--input_dim", type=int, default=14)
-    p.add_argument("--hidden_dim", type=int, default=64)
+    p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
 
@@ -626,6 +713,11 @@ def parse_args():
     #MCD
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
+    p.add_argument("--ms_mode", type=str, default="pairs",
+                   choices=["combine", "balanced", "pairs"],
+                   help="combine: pooled source ;"
+                        "balanced: one batch per animal, one head pair;"
+                        "pairs: one head pair per animal")
     p.add_argument("--num_k", type=int, default=1,
                    help="generator updates per batch in Step C (MCD's num_k)")
 
@@ -670,10 +762,10 @@ def main():
     # MCD DRT ST
     allowed_values = [
         (False, False, False),
-        (False, True, False),
+        # (False, True, False),
         (True, False, False),
-        (True, True, False),
-        (True, True, True)
+        # (True, True, False),
+        # (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
