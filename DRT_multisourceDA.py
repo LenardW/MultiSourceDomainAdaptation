@@ -158,11 +158,12 @@ class DynamicBackbone(nn.Module):
         return h
 
 class RegressorHead(nn.Module):
-    def __init__(self, hidden_dim=128):
+    def __init__(self, hidden_dim=128, dropout=0.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
 
@@ -187,27 +188,82 @@ def flat_heads(heads):
     """[(F1, F2), ...] -> flat list of every head."""
     return [h for pair in heads for h in pair]
 
-def ensemble(heads, feat):
-    """Prediction of the full ensemble: mean over every head of every pair."""
-    return torch.stack([h(feat) for h in flat_heads(heads)], 0).mean(0)
+def ensemble(heads, feat, weights=None):
+    """Prediction of the ensemble.
 
-def mean_discrepancy(heads, feat):
+    Each source contributes the mean of its own pair; the sources are then
+    combined uniformly or with MMPD's weights w_k (Eq. 12).
+    """
+    per_source = torch.stack([(p[0](feat) + p[1](feat)) / 2.0
+                              for p in heads], 0)              # [M, B]
+    if weights is None:
+        return per_source.mean(0)
+    return (per_source * weights.to(per_source.device).view(-1, 1)).sum(0)
+
+def mean_discrepancy(heads, feat, kind="bounded"):
     """Mean over pairs of the within-pair discrepancy."""
-    return sum(discrepancy_loss(F1(feat), F2(feat))
+    return sum(discrepancy_loss(F1(feat), F2(feat), kind)
                for F1, F2 in heads) / len(heads)
 
-def discrepancy_loss(pred1, pred2):
-    return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
-# def discrepancy_loss(pred1, pred2, kind="bounded"):
-#     d = torch.abs(pred1 - pred2)
-#     return d.mean() if kind == "l1" else torch.mean(1.0 - torch.exp(-d))
+def discrepancy_loss(pred1, pred2, kind="bounded"):
+    """Disagreement of a predictor pair on one batch.
+
+    bounded: 1 - exp(-|d|), saturates at 1, so a pair that is already far
+             apart gets almost no gradient in Step B.
+    l2:      MMPD's Eq. 6, the mean squared difference, unbounded.
+    """
+    d = pred1 - pred2
+    if kind == "l2":
+        return torch.mean(d ** 2)
+    return torch.mean(1.0 - torch.exp(-torch.abs(d)))
+
+@torch.no_grad()
+def mmpd_weights(G, heads, src_loaders, trg_loader, device, args, max_batches=8):
+    """MMPD's weighted ensemble schema (Eq. 8-11).
+
+    A source is well aligned with the target when its pair predicts its OWN
+    source data accurately (small error_k) and disagrees little on the target
+    (small dis_k), so alpha_k = beta / (error_k * dis_k), normalised with a
+    softmax. The paper found uniform averaging unsatisfying because sources
+    differ in how well they match the target.
+
+    Both quantities are label-free with respect to the target, so nothing here
+    peeks at target labels. Returns None for uniform averaging.
+    """
+    if args.ens_mode == "uniform" or len(heads) < 2 or len(heads) != len(src_loaders):
+        return None
+
+    G.eval()
+    for h in flat_heads(heads):
+        h.eval()
+
+    err = torch.zeros(len(heads))
+    dis = torch.zeros(len(heads))
+    trg_iter = iter(trg_loader)
+    src_iters = [iter(l) for l in src_loaders]
+    nb = 0
+
+    for _ in range(max_batches):
+        (X_t, _), trg_iter = next_batch(trg_iter, trg_loader)
+        feat_t = G(X_t.to(device))
+        for k, loader in enumerate(src_loaders):
+            (X_k, Y_k), src_iters[k] = next_batch(src_iters[k], loader)
+            feat_k = G(X_k.to(device))
+            pred_k = (heads[k][0](feat_k) + heads[k][1](feat_k)) / 2.0
+            err[k] += float(F.mse_loss(pred_k, Y_k.to(device)))          # Eq. 9
+            dis[k] += float(torch.mean((heads[k][0](feat_t)
+                                        - heads[k][1](feat_t)) ** 2))    # Eq. 10
+        nb += 1
+
+    alpha = args.ens_beta / (err / nb * dis / nb + 1e-8)                  # Eq. 8
+    return torch.softmax(alpha, 0)                                        # Eq. 11
 
 def variance_penalty(pred1, pred2):
     return -(torch.var(pred1) + torch.var(pred2))
 
 
 @torch.no_grad()
-def evaluate(G, heads, loader, device, normalizer):
+def evaluate(G, heads, loader, device, normalizer, weights=None):
     G.eval()
     for h in flat_heads(heads):
         h.eval()
@@ -217,9 +273,8 @@ def evaluate(G, heads, loader, device, normalizer):
     for X_b, Y_b in loader:
         X_b, Y_b = X_b.to(device), Y_b.to(device)
         feat = G(X_b)
-        # ensemble: average over every head (2 in combine/balanced mode,
-        # 2 per source animal in pairs mode)
-        pred = ensemble(heads, feat)
+        # ensemble over the per-source pairs, uniform or MMPD-weighted
+        pred = ensemble(heads, feat, weights)
         preds.append(pred.cpu())
         targets.append(Y_b.cpu())
 
@@ -395,6 +450,9 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
             # ---- Steps B and C: MCD only ----
             if args.MCD_activated:
+                for h in flat_heads(heads):      # dropout off: the discrepancy
+                    h.eval()                      # must measure real disagreement
+
                 # Step B: heads maximise target discrepancy, backbone frozen.
                 for p in G.parameters():
                     p.requires_grad = False
@@ -416,7 +474,7 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
                 # every pair marks the support of its own animal; the generator
                 # must later pull the target inside all of them at once
-                dis = mean_discrepancy(heads, feat_t_d)
+                dis = mean_discrepancy(heads, feat_t_d, args.disc_kind)
                 vpen = sum(variance_penalty(F1(feat_t_d), F2(feat_t_d))
                            for F1, F2 in heads) / len(heads)
 
@@ -436,7 +494,7 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
                 for _ in range(args.num_k):
                     feat_t = G(X_t)
-                    dis = mean_discrepancy(heads, feat_t)
+                    dis = mean_discrepancy(heads, feat_t, args.disc_kind)
                     vpen = sum(variance_penalty(F1(feat_t), F2(feat_t))
                                for F1, F2 in heads) / len(heads)
 
@@ -451,17 +509,24 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
                 with torch.no_grad():
                     feat_s = G(torch.cat(xs, 0))
                     feat_t = G(X_t)
-                    stats["dis_s"] += float(mean_discrepancy(heads, feat_s))
-                    stats["dis"]   += float(mean_discrepancy(heads, feat_t))
+                    stats["dis_s"] += float(mean_discrepancy(heads, feat_s,
+                                                             args.disc_kind))
+                    stats["dis"]   += float(mean_discrepancy(heads, feat_t,
+                                                             args.disc_kind))
                     stats["vpen"]  += float(
                         sum(variance_penalty(F1(feat_t), F2(feat_t))
                             for F1, F2 in heads) / len(heads))
                 G.train()
+                for h in flat_heads(heads):
+                    h.train()
 
         sch_g.step(); sch_f.step()
 
         n, nb = max(stats["n"], 1), max(stats["nb"], 1)
-        mae, rmse, r2, corr = evaluate(G, heads, val_loader, device, normalizer)
+        # MMPD's w_k, recomputed each epoch from a few batches (cheap)
+        weights = mmpd_weights(G, heads, src_loaders, trg_loader, device, args)
+        mae, rmse, r2, corr = evaluate(G, heads, val_loader, device, normalizer,
+                                       weights)
         metrics = (mae, rmse, r2, corr)
 
         log = {
@@ -478,6 +543,9 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             log["discrepancy_trg"] = stats["dis"] / nb
             log["discrepancy_ratio"] = stats["dis"]/ nb / (stats["dis_s"]/ nb + 1e-8)
             log["variance_penalty"] = stats["vpen"] / nb
+        if weights is not None:
+            for k, w in enumerate(weights.tolist()):
+                log[f"source_weight_{k}"] = w
         if pseudo_iter is not None:
             log["mse_pseudo"] = stats["st"] / n
         if args.DRT_activated:
@@ -539,7 +607,12 @@ def train(args):
     else:
         # one loader per animal; the per-animal batch size keeps the total
         # number of source samples per step at roughly args.batch_size
-        per = max(args.batch_size // len(source_domains), 2)
+        # MMPD underperformed when its source domains were small relative to
+        # the target, because each source-specific pair was then trained on too
+        # little data. --src_batch_per_domain keeps a usable batch per animal
+        # instead of splitting one batch four ways.
+        per = (args.src_batch_per_domain or
+               max(args.batch_size // len(source_domains), 2))
         src_loaders = [make_loader(normalizer.transform_X(Xs),
                                    normalizer.transform_Y(Ys), per)
                        for Xs, Ys in source_domains]
@@ -558,13 +631,17 @@ def train(args):
     # pairs: one head pair per source animal (M3SDA-beta's structure), so the
     # pairs differ because the animals differ, not only because of the init
     n_pairs = len(source_domains) if args.ms_mode == "pairs" else 1
-    heads = [(RegressorHead(hidden_dim=args.hidden_dim).to(device),
-              RegressorHead(hidden_dim=args.hidden_dim).to(device))
+    heads = [(RegressorHead(hidden_dim=args.hidden_dim, dropout=args.head_dropout).to(device),
+              RegressorHead(hidden_dim=args.hidden_dim, dropout=args.head_dropout).to(device))
              for _ in range(n_pairs)]
 
-    opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
-    opt_f = optim.SGD([p for h in flat_heads(heads) for p in h.parameters()],
-                      lr=args.lr_f, momentum=0.9)
+    head_ps = [p for h in flat_heads(heads) for p in h.parameters()]
+    if args.optimizer == "adam":
+        opt_g = optim.Adam(G.parameters(), lr=args.lr)
+        opt_f = optim.Adam(head_ps, lr=args.lr_f)
+    else:
+        opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
+        opt_f = optim.SGD(head_ps, lr=args.lr_f, momentum=0.9)
 
     sch_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule,
                                            gamma=0.1)
@@ -703,6 +780,8 @@ def parse_args():
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
+    p.add_argument("--head_dropout", type=float, default=0.2,
+                   help="dropout in the regressor heads; 0 = off")
 
     # DRT
     p.add_argument("--K", type=int, default=4)
@@ -713,13 +792,31 @@ def parse_args():
     #MCD
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
-    p.add_argument("--ms_mode", type=str, default="pairs",
+    p.add_argument("--ms_mode", type=str, default="combine",
                    choices=["combine", "balanced", "pairs"],
                    help="combine: pooled source ;"
                         "balanced: one batch per animal, one head pair;"
                         "pairs: one head pair per animal")
     p.add_argument("--num_k", type=int, default=1,
                    help="generator updates per batch in Step C (MCD's num_k)")
+
+    # MMPD 
+    p.add_argument("--mmpd", action="store_true",
+                   help="faithful MMPD preset: pairs + squared discrepancy, "
+                        "eta=1, no variance penalty, no warmup, Adam, "
+                        "weighted ensemble")
+    p.add_argument("--disc_kind", type=str, default="bounded",
+                   choices=["bounded", "l2"],
+                   help="bounded: 1-exp(-|d|); l2: MMPD's mean squared diff")
+    p.add_argument("--ens_mode", type=str, default="uniform",
+                   choices=["uniform", "mmpd"],
+                   help="mmpd: weight each source by 1/(error_k * dis_k)")
+    p.add_argument("--ens_beta", type=float, default=1.0,
+                   help="beta in MMPD Eq. 8; larger = peakier weights")
+    p.add_argument("--src_batch_per_domain", type=int, default=0,
+                   help="samples per animal per step; 0 = batch_size // M")
+    p.add_argument("--optimizer", type=str, default="sgd",
+                   choices=["sgd", "adam"])
 
     # self-training
     p.add_argument("--st_epochs", type=int, default=30)
@@ -740,7 +837,17 @@ def parse_args():
     p.add_argument("--shap_seed", type=int, default=100, help="only this seed gets SHAP")
     p.add_argument("--feature_names", type=str, default="", help="comma-separated, 14 names")
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    if args.mmpd:       # to replicate the MMPD paper
+        args.ms_mode = "pairs"
+        args.disc_kind = "l2"
+        args.ens_mode = "mmpd"
+        args.eta = 1.0
+        args.gamma = 0.0
+        args.warmup_epochs = 0
+        args.optimizer = "adam"
+    return args
 
 def main():
 
@@ -761,11 +868,11 @@ def main():
 
     # MCD DRT ST
     allowed_values = [
-        (False, False, False),
+        # (False, False, False),
         # (False, True, False),
         (True, False, False),
-        # (True, True, False),
-        # (True, True, True)
+        (True, True, False),
+        (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
