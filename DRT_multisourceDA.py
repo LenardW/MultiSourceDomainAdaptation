@@ -780,7 +780,7 @@ def parse_args():
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
-    p.add_argument("--head_dropout", type=float, default=0.2,
+    p.add_argument("--head_dropout", type=float, default=0,
                    help="dropout in the regressor heads; 0 = off")
 
     # DRT
@@ -801,7 +801,7 @@ def parse_args():
                    help="generator updates per batch in Step C (MCD's num_k)")
 
     # MMPD 
-    p.add_argument("--mmpd", action="store_true",
+    p.add_argument("--mmpd", action="store_false",
                    help="faithful MMPD preset: pairs + squared discrepancy, "
                         "eta=1, no variance penalty, no warmup, Adam, "
                         "weighted ensemble")
@@ -868,8 +868,8 @@ def main():
 
     # MCD DRT ST
     allowed_values = [
-        # (False, False, False),
-        # (False, True, False),
+        (False, False, False),
+        (False, True, False),
         (True, False, False),
         (True, True, False),
         (True, True, True)
