@@ -18,6 +18,12 @@ Options that do not change the architecture:
                               (target: statistics of its unlabelled adaptation split)
                   The stroke work is always standardised with the pooled source statistics.
   --K             number of DRT basis matrices
+  --target_bn     source      target data are normalised with the BatchNorm statistics of the
+                              source data (no adaptation through BN)
+                  target      target data are normalised with target statistics: batch
+                              statistics in the MCD steps, statistics of the unlabelled
+                              adaptation split for pseudo-labelling and evaluation (AdaBN,
+                              Li et al. 2017; Csurka et al. 2022, p. 49)
 
 Configurations (--configs):
   source_only, drt, mcd, mcd_drt, mcd_drt_st  : component ablation
@@ -25,9 +31,16 @@ Configurations (--configs):
                                                 the target animal itself (upper reference)
 
 Protocols (--protocol):
-  loao   leave-one-animal-out over the main animals (model selection happens here)
-  test   targets = untouched test animals, sources = all main animals. Run ONLY with the
-         frozen final configuration.
+  loao   leave-one-animal-out over --main_animals (default: the 10 animals without speed
+         ramps); every animal is the target once, all others are the sources
+  test   targets = --test_animals, sources = all --main_animals (e.g. the speed-ramp
+         animals as targets with the non-ramp animals as sources)
+
+Ablation design: the defaults below are THE method (fixed in advance). Every ablation
+changes exactly one setting relative to these defaults; results are not carried forward.
+
+Features: --drop_features removes input columns by index (0-based), e.g. the five
+features that need invasive pressures.
 
 Target data: the target animal is split into an unlabelled adaptation split (used by MCD and
 self-training without labels) and a held-out test split. Labels of the target are used
@@ -48,6 +61,11 @@ Hyperparameters and where they come from
   ST confidence = head agreement own choice (regression has no class probability)
   discrepancy = 1 - exp(-|d|)    own choice (bounded regression analogue of Saito Eq. 1);
                                  --discrepancy l1 gives |d|, the direct analogue
+  gamma = 0 (no variance penalty) as in Saito et al.; an unbounded variance penalty diverged
+                                 for a target outside the source support, so a penalty is only
+                                 available with a cap (--vpen_cap)
+  target split: 50 time blocks   avoids leakage between neighbouring beats, keeps the test
+                                 set representative of the whole recording
   lr_f, epochs, schedule         set on the source data (stable source-only training)
   eta, gamma, warmup, ramp,
     st_* parameters              selected on the main animals (protocol loao)
@@ -70,7 +88,16 @@ import torch.nn.functional as F
 from scipy.stats import pearsonr
 
 ARCH = "mlp_drt_linear"
+# animals without speed ramps (intervention 4); anim3 has only short ramp sections and
+# shows no concept shift
+
+
+# MAIN_ANIMALS = ["anim3", "anim4", "anim7", "anim8", "anim10",
+#                 "anim11", "anim13", "anim16", "anim19", "anim20"]
+# MAIN_ANIMALS = ["anim3", "anim4", "anim8", "anim10",
+#                 "anim11", "anim16", "anim20"]
 MAIN_ANIMALS = ["anim1", "anim3", "anim4", "anim8", "anim10"]
+# RAMP_ANIMALS = ["anim1", "anim107", "anim108", "anim111", "anim113"]
 DEFAULT_SEEDS = [100, 200, 74, 15, 984]
 
 CONFIGS = {
@@ -156,15 +183,27 @@ class Fold:
     test_idx: np.ndarray
 
 
+def kept_columns(args, n_cols):
+    drop = {int(i) for i in args.drop_features.split(",") if i != ""}
+    if any(i < 0 or i >= n_cols for i in drop):
+        raise ValueError(f"--drop_features out of range for {n_cols} columns")
+    return [i for i in range(n_cols) if i not in drop]
+
+
 def build_fold(args, target: str, sources: list, oracle: bool) -> Fold:
     Xt, yt = load_animal(args.data_dir, target, args.drop_negative)
+    cols = kept_columns(args, Xt.shape[1])
+    Xt = Xt[:, cols]
     adapt, test = split_target(len(Xt), args.test_ratio, args.split,
                                args.split_seed, args.n_blocks)
 
     if oracle:   # upper reference: labelled data of the target animal itself
         src = [(target, Xt[adapt], yt[adapt])]
     else:
-        src = [(aid, *load_animal(args.data_dir, aid, args.drop_negative)) for aid in sources]
+        src = []
+        for aid in sources:
+            X, y = load_animal(args.data_dir, aid, args.drop_negative)
+            src.append((aid, X[:, cols], y))
 
     y_stats = Stats.fit(np.concatenate([y for _, _, y in src]))
 
@@ -315,6 +354,46 @@ def frozen_bn(module):
             m.train(mode)
 
 
+@contextmanager
+def target_batch_bn(module):
+    """BatchNorm uses the statistics of the current (target) batch but does not update the
+    running statistics, which therefore stay pure source statistics."""
+    bns = [m for m in module.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    saved = [(m.training, m.momentum) for m in bns]
+    for m in bns:
+        m.train()
+        m.momentum = 0.0
+    try:
+        yield
+    finally:
+        for m, (mode, mom) in zip(bns, saved):
+            m.train(mode)
+            m.momentum = mom
+
+
+def target_pass(module, args):
+    return target_batch_bn(module) if args.target_bn == "target" else frozen_bn(module)
+
+
+@torch.no_grad()
+def with_target_bn_stats(model, X, batch_size=512):
+    """Copy of the model whose BatchNorm statistics are recomputed on the target data X
+    (AdaBN). All other parameters are unchanged."""
+    import copy
+    m = copy.deepcopy(model)
+    bns = [b for b in m.G.modules() if isinstance(b, nn.modules.batchnorm._BatchNorm)]
+    for b in bns:
+        b.reset_running_stats()
+        b.momentum = None              # cumulative average over all batches
+    m.eval()
+    for b in bns:
+        b.train()
+    for i in range(0, len(X), batch_size):
+        m.G(X[i:i + batch_size])
+    m.eval()
+    return m
+
+
 # =============================================================================
 # Losses
 # =============================================================================
@@ -334,14 +413,13 @@ def source_loss(model, feats, ys, per_domain):
 
 
 def target_terms(model, feat_t, kind, cap):
-    """Discrepancy and variance penalty on target features, averaged over head pairs."""
+    """Discrepancy and (capped) variance penalty on target features, averaged over pairs."""
     dis, vpen = [], []
     for k in range(model.n_pairs):
         h1, h2 = model.pair(k)
         p1, p2 = h1(feat_t), h2(feat_t)
         dis.append(discrepancy(p1, p2, kind))
         vpen.append(-(p1.var().clamp(max=cap) + p2.var().clamp(max=cap)))
-        # vpen.append(-(p1.var() + p2.var()))
     return torch.stack(dis).mean(), torch.stack(vpen).mean()
 
 
@@ -410,7 +488,7 @@ def run_epochs(model, opt_g, opt_f, scheds, streams, trg_stream, pseudo_stream,
             loss_a = l_src
             if pseudo_stream is not None:
                 xp, yp = pseudo_stream.next()
-                with frozen_bn(model.G):
+                with target_pass(model.G, args):
                     l_ps = pseudo_loss(model, model.G(xp), yp)
                 loss_a = loss_a + args.st_weight * l_ps
                 log["pseudo_mse"] += l_ps.item()
@@ -424,9 +502,12 @@ def run_epochs(model, opt_g, opt_f, scheds, streams, trg_stream, pseudo_stream,
             (xt,) = trg_stream.next()
 
             # ---- Step B: heads maximise the target discrepancy, G fixed
-            with torch.no_grad(), frozen_bn(model.G):
-                fs = torch.split(model.G(torch.cat(xs)), sizes)
-                ft = model.G(xt)
+            with torch.no_grad():
+                with frozen_bn(model.G):
+                    fs = torch.split(model.G(torch.cat(xs)), sizes)
+                with target_pass(model.G, args):
+                    ft = model.G(xt)
+                log["trg_pred_std"] += model.all_heads(ft).std(1).mean().item()
             dis, vpen = target_terms(model, ft, args.discrepancy, args.vpen_cap)
             loss_b = source_loss(model, fs, ys, per_domain) + w * (args.gamma * vpen - args.eta * dis)
             opt_f.zero_grad()
@@ -436,7 +517,7 @@ def run_epochs(model, opt_g, opt_f, scheds, streams, trg_stream, pseudo_stream,
             # ---- Step C: G minimises the target discrepancy, heads fixed (n times)
             set_requires_grad(model.heads, False)
             for _ in range(args.num_k):
-                with frozen_bn(model.G):
+                with target_pass(model.G, args):
                     ft = model.G(xt)
                 dis, vpen = target_terms(model, ft, args.discrepancy, args.vpen_cap)
                 loss_c = w * (args.eta * dis + args.gamma * vpen)
@@ -454,12 +535,22 @@ def run_epochs(model, opt_g, opt_f, scheds, streams, trg_stream, pseudo_stream,
             msg = (f"    [{phase}] ep {epoch:3d}  w={w:.2f}  "
                    f"src_mse={log['src_mse'] / steps:.4f}")
             if cfg["mcd"] and w > 0:
-                msg += f"  trg_dis={log['trg_dis'] / steps:.4f}"
+                msg += (f"  trg_dis={log['trg_dis'] / steps:.4f}"
+                        f"  trg_pred_std={log['trg_pred_std'] / steps:.2f}")
             if pseudo_stream is not None:
                 msg += f"  pseudo_mse={log['pseudo_mse'] / steps:.4f}"
             if args.monitor_target:    # debugging only: uses target labels
-                msg += f"  [label-based] test_rmse={evaluate(model, fold, 'test', device)['rmse']:.1f}"
+                msg += (f"  [label-based] test_rmse="
+                        f"{evaluate(eval_model(model, fold, args, device), fold, 'test', device)['rmse']:.1f}")
             print(msg, flush=True)
+
+
+def eval_model(model, fold, args, device):
+    """Model used for target predictions: with --target_bn target, the BatchNorm statistics
+    are recomputed on the unlabelled adaptation split of the target."""
+    if args.target_bn == "target":
+        return with_target_bn_stats(model, torch.as_tensor(fold.adapt_X, device=device))
+    return model
 
 
 @torch.no_grad()
@@ -483,7 +574,7 @@ def train_run(args, cfg_name, fold, seed, device):
 
     per_domain = args.source_mode == "per_domain" and not cfg["oracle"]
     n_pairs = len(fold.src_X) if per_domain else 1
-    model = MSDAModel(args.input_dim, args.hidden_dim, n_pairs, args.K,
+    model = MSDAModel(fold.src_X[0].shape[1], args.hidden_dim, n_pairs, args.K,
                       cfg["drt"], args.basis_scale).to(device)
 
     opt_g = torch.optim.SGD(model.G.parameters(), lr=args.lr, momentum=0.9)
@@ -510,7 +601,8 @@ def train_run(args, cfg_name, fold, seed, device):
 
     keep_rate = float("nan")
     if cfg["st"]:
-        Xp, yp, keep_rate = make_pseudo_labels(model, tens(fold.adapt_X),
+        Xp, yp, keep_rate = make_pseudo_labels(eval_model(model, fold, args, device),
+                                               tens(fold.adapt_X),
                                                args.st_keep_quantile, args.discrepancy)
         print(f"    [st] kept {keep_rate:.0%} of the adaptation beats as pseudo-labels")
         for o, lr in ((opt_g, args.lr), (opt_f, args.lr_f)):
@@ -523,10 +615,11 @@ def train_run(args, cfg_name, fold, seed, device):
                    cfg, args, per_domain, steps, device, fold, "st")
 
     result = {"st_keep_rate": keep_rate}
+    final = eval_model(model, fold, args, device)
     for split in ("test", "adapt"):
         if cfg["oracle"] and split == "adapt":
             continue   # adaptation split is the oracle's training data
-        for k, v in evaluate(model, fold, split, device).items():
+        for k, v in evaluate(final, fold, split, device).items():
             result[f"{split}_{k}"] = v
 
     if args.save_dir:
@@ -546,8 +639,10 @@ def train_run(args, cfg_name, fold, seed, device):
 # Experiment loop and output
 # =============================================================================
 
-FIELDS = ["run_id", "arch", "protocol", "config", "source_mode", "norm", "K", "split",
-          "discrepancy", "num_k", "eta", "gamma", "warmup_epochs", "epochs", "target",
+FIELDS = ["run_id", "arch", "protocol", "config", "source_mode", "norm", "target_bn", "K",
+          "split", "n_blocks", "discrepancy", "num_k", "eta", "gamma", "vpen_cap",
+          "warmup_epochs", "ramp_epochs", "epochs", "st_keep_quantile", "st_weight",
+          "drop_features", "target",
           "sources", "seed", "test_rmse", "test_mae", "test_r2", "test_r",
           "adapt_rmse", "adapt_mae", "adapt_r2", "adapt_r", "st_keep_rate"]
 
@@ -581,7 +676,9 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     # data and protocol
-    p.add_argument("--data_dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Tierdaten"))
+    p.add_argument("--data_dir",
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "..", "Tierdaten"))
     p.add_argument("--protocol", choices=["loao", "test"], default="loao")
     p.add_argument("--main_animals", default=",".join(MAIN_ANIMALS))
     p.add_argument("--test_animals", default="",
@@ -599,8 +696,10 @@ def parse_args():
     p.add_argument("--source_mode", choices=["pooled", "balanced", "per_domain"], default="pooled")
     p.add_argument("--norm", choices=["global", "per_animal"], default="global")
     p.add_argument("--K", type=int, default=4)
+    p.add_argument("--target_bn", choices=["source", "target"], default="source")
+    p.add_argument("--drop_features", default="",
+                   help="comma-separated 0-based column indices to remove, e.g. 0,1,7,8,9")
     # architecture
-    p.add_argument("--input_dim", type=int, default=14)
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--basis_scale", type=float, default=0.1)
     # optimisation
@@ -611,10 +710,13 @@ def parse_args():
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     # MCD
     p.add_argument("--discrepancy", choices=["bounded", "l1"], default="bounded")
-    p.add_argument("--vpen_cap", type=float, default=1.0, help="variance above this value is not rewarded")
     p.add_argument("--num_k", type=int, default=4)
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
-    p.add_argument("--gamma", type=float, default=0.0, help="variance penalty weight (0 = as in Saito et al.)")
+    p.add_argument("--gamma", type=float, default=0.0,
+                   help="variance penalty weight (0 = as in Saito et al.)")
+    p.add_argument("--vpen_cap", type=float, default=1.0,
+                   help="prediction variance above this value is not rewarded "
+                        "(standardised stroke work has variance ~1)")
     p.add_argument("--warmup_epochs", type=int, default=100)
     p.add_argument("--ramp_epochs", type=int, default=20)
     # self-training
@@ -658,7 +760,9 @@ def main():
 
     run_id = time.strftime("%Y%m%d-%H%M%S")
     print(f"run {run_id}: {ARCH}, protocol={args.protocol}, source_mode={args.source_mode}, "
-          f"norm={args.norm}, K={args.K}, split={args.split}, device={device}")
+          f"norm={args.norm}, target_bn={args.target_bn}, K={args.K}, split={args.split} "
+          f"({args.n_blocks} blocks), gamma={args.gamma}, num_k={args.num_k}, "
+          f"drop_features={args.drop_features or 'none'}, device={device}")
 
     total = len(configs) * len(targets) * len(seeds)
     i = 0
@@ -675,9 +779,13 @@ def main():
                 append_row(args.out, {
                     "run_id": run_id, "arch": ARCH, "protocol": args.protocol,
                     "config": cfg_name, "source_mode": args.source_mode, "norm": args.norm,
-                    "K": args.K, "split": args.split, "discrepancy": args.discrepancy,
+                    "target_bn": args.target_bn, "K": args.K, "split": args.split,
+                    "n_blocks": args.n_blocks, "discrepancy": args.discrepancy,
                     "num_k": args.num_k, "eta": args.eta, "gamma": args.gamma,
-                    "warmup_epochs": args.warmup_epochs, "epochs": args.epochs,
+                    "vpen_cap": args.vpen_cap, "warmup_epochs": args.warmup_epochs,
+                    "ramp_epochs": args.ramp_epochs, "epochs": args.epochs,
+                    "st_keep_quantile": args.st_keep_quantile, "st_weight": args.st_weight,
+                    "drop_features": args.drop_features or "none",
                     "target": target, "sources": ";".join(fold.source_ids), "seed": seed,
                     **res})
 
