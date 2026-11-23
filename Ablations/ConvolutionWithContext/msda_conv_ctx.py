@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 """
 Multi-source unsupervised domain adaptation for stroke-work regression.
 

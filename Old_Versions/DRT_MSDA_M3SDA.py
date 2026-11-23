@@ -158,12 +158,11 @@ class DynamicBackbone(nn.Module):
         return h
 
 class RegressorHead(nn.Module):
-    def __init__(self, hidden_dim=128, dropout=0.0):
+    def __init__(self, hidden_dim=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
 
@@ -191,72 +190,90 @@ def flat_heads(heads):
 def ensemble(heads, feat, weights=None):
     """Prediction of the ensemble.
 
-    Each source contributes the mean of its own pair; the sources are then
-    combined uniformly or with MMPD's weights w_k (Eq. 12).
+    Each source domain contributes the mean of its own heads; the domains are
+    then combined with `weights` (M3SDA's W) or uniformly (M3SDA*).
     """
-    per_source = torch.stack([(p[0](feat) + p[1](feat)) / 2.0
-                              for p in heads], 0)              # [M, B]
+    per_domain = torch.stack([torch.stack([h(feat) for h in pair], 0).mean(0)
+                              for pair in heads], 0)          # [n_dom, B]
     if weights is None:
-        return per_source.mean(0)
-    return (per_source * weights.to(per_source.device).view(-1, 1)).sum(0)
+        return per_domain.mean(0)
+    return (per_domain * weights.to(per_domain.device).view(-1, 1)).sum(0)
 
-def mean_discrepancy(heads, feat, kind="bounded"):
-    """Mean over pairs of the within-pair discrepancy."""
-    return sum(discrepancy_loss(F1(feat), F2(feat), kind)
-               for F1, F2 in heads) / len(heads)
+def mean_discrepancy(heads, feat):
+    """Mean over domains of the within-pair discrepancy."""
+    return sum(discrepancy_loss(pair[0](feat), pair[1](feat))
+               for pair in heads) / len(heads)
 
-def discrepancy_loss(pred1, pred2, kind="bounded"):
-    """Disagreement of a predictor pair on one batch.
+def moment_distance(feats, feat_t, orders=2, source_source=True):
+    """M3SDA's moment distance MD^2 (paper Eq. 1).
 
-    bounded: 1 - exp(-|d|), saturates at 1, so a pair that is already far
-             apart gets almost no gradient in Step B.
-    l2:      MMPD's Eq. 6, the mean squared difference, unbounded.
+    `feats` is one feature batch per source animal, `feat_t` the target batch.
+    For each order k the first term matches E[X^k] of every source against the
+    target; the second matches the sources against each other. The paper's
+    central claim is that the target cannot be aligned with every source while
+    the sources are not aligned among themselves, and their ablation shows the
+    source-source term adds on top of the source-target one.
+
+    Note this is estimated from the batch, so the second moment is noisy at
+    small per-animal batch sizes.
     """
-    d = pred1 - pred2
-    if kind == "l2":
-        return torch.mean(d ** 2)
-    return torch.mean(1.0 - torch.exp(-torch.abs(d)))
+    n = len(feats)
+    md = feat_t.new_zeros(())
+    for k in range(1, orders + 1):
+        ms = [(f ** k).mean(0) for f in feats]
+        mt = (feat_t ** k).mean(0)
+        md = md + sum((m - mt).norm() for m in ms) / n          # source <-> target
+        if source_source and n > 1:
+            ij = [(i, j) for i in range(n) for j in range(i + 1, n)]
+            md = md + sum((ms[i] - ms[j]).norm() for i, j in ij) / len(ij)
+    return md
 
 @torch.no_grad()
-def mmpd_weights(G, heads, src_loaders, trg_loader, device, args, max_batches=8):
-    """MMPD's weighted ensemble schema (Eq. 8-11).
+def domain_weights(G, heads, src_loaders, trg_loader, device, mode,
+                   max_batches=8, orders=2):
+    """Per-domain ensemble weights W (M3SDA's weighted schema).
 
-    A source is well aligned with the target when its pair predicts its OWN
-    source data accurately (small error_k) and disagrees little on the target
-    (small dis_k), so alpha_k = beta / (error_k * dis_k), normalised with a
-    softmax. The paper found uniform averaging unsatisfying because sources
-    differ in how well they match the target.
-
-    Both quantities are label-free with respect to the target, so nothing here
-    peeks at target labels. Returns None for uniform averaging.
+    The paper sets w_i from the source-only accuracy of domain i on the target,
+    which needs target labels. Two unsupervised stand-ins, both expressing how
+    close a source is to the target:
+      moment      w_i proportional to 1 / MD^2(D_i, D_T)
+      discrepancy w_i proportional to 1 / mean target discrepancy of pair i
+    Returns None for uniform weighting (M3SDA*) or a single domain.
     """
-    if args.ens_mode == "uniform" or len(heads) < 2 or len(heads) != len(src_loaders):
+    if mode == "uniform" or len(heads) < 2:
         return None
 
     G.eval()
     for h in flat_heads(heads):
         h.eval()
 
-    err = torch.zeros(len(heads))
-    dis = torch.zeros(len(heads))
+    scores = torch.zeros(len(heads))
+    nb = 0
     trg_iter = iter(trg_loader)
     src_iters = [iter(l) for l in src_loaders]
-    nb = 0
 
     for _ in range(max_batches):
         (X_t, _), trg_iter = next_batch(trg_iter, trg_loader)
         feat_t = G(X_t.to(device))
-        for k, loader in enumerate(src_loaders):
-            (X_k, Y_k), src_iters[k] = next_batch(src_iters[k], loader)
-            feat_k = G(X_k.to(device))
-            pred_k = (heads[k][0](feat_k) + heads[k][1](feat_k)) / 2.0
-            err[k] += float(F.mse_loss(pred_k, Y_k.to(device)))          # Eq. 9
-            dis[k] += float(torch.mean((heads[k][0](feat_t)
-                                        - heads[k][1](feat_t)) ** 2))    # Eq. 10
+        for i, loader in enumerate(src_loaders):
+            (X_i, _), src_iters[i] = next_batch(src_iters[i], loader)
+            if mode == "moment":
+                feat_i = G(X_i.to(device))
+                scores[i] += float(moment_distance([feat_i], feat_t, orders,
+                                                   source_source=False))
+            else:   # discrepancy
+                scores[i] += float(discrepancy_loss(heads[i][0](feat_t),
+                                                    heads[i][1](feat_t)))
         nb += 1
 
-    alpha = args.ens_beta / (err / nb * dis / nb + 1e-8)                  # Eq. 8
-    return torch.softmax(alpha, 0)                                        # Eq. 11
+    w = 1.0 / (scores / max(nb, 1) + 1e-8)
+    return w / w.sum()
+
+def discrepancy_loss(pred1, pred2):
+    return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
+# def discrepancy_loss(pred1, pred2, kind="bounded"):
+#     d = torch.abs(pred1 - pred2)
+#     return d.mean() if kind == "l1" else torch.mean(1.0 - torch.exp(-d))
 
 def variance_penalty(pred1, pred2):
     return -(torch.var(pred1) + torch.var(pred2))
@@ -273,7 +290,7 @@ def evaluate(G, heads, loader, device, normalizer, weights=None):
     for X_b, Y_b in loader:
         X_b, Y_b = X_b.to(device), Y_b.to(device)
         feat = G(X_b)
-        # ensemble over the per-source pairs, uniform or MMPD-weighted
+        # ensemble over the per-domain heads, uniform (M3SDA*) or weighted
         pred = ensemble(heads, feat, weights)
         preds.append(pred.cpu())
         targets.append(Y_b.cpu())
@@ -311,11 +328,17 @@ def basis_similarity(layer):
 @torch.no_grad()
 def make_pseudo_labels(G, heads, X_trg, device, keep_quantile):
     """
-    one-shot pseudo-labelling of the unlabelled target split
-    pseudo-labels above a confidence threshold are used to train DRT
-    again together with source samples
-    uses head agreement instead of softmax confidence
-    threshold is a quantile of the observed discrepancy
+    One-shot pseudo-labelling of the unlabelled target split.
+
+    The paper runs self-training as a *second training round* after DRT has
+    converged, not as an online per-batch step: pseudo-labels above a
+    confidence threshold are used to train DRT again together with source
+    samples. Regression has no softmax confidence, so head agreement stands in
+    for it -- which is also the quantity MCD already optimises, making it the
+    natural confidence proxy here.
+
+    The threshold is a quantile of the observed discrepancy rather than an
+    absolute number, so the keep rate is stable across animals and scales.
     """
     G.eval()
     for h in flat_heads(heads):
@@ -327,8 +350,13 @@ def make_pseudo_labels(G, heads, X_trg, device, keep_quantile):
         feat = G(Xt[i:i + 512])
         means.append(ensemble(heads, feat))
         # confidence: mean within-pair disagreement over all pairs
-        discs.append(torch.stack([torch.abs(F1(feat) - F2(feat))
-                                  for F1, F2 in heads], 0).mean(0))
+        if len(heads[0]) > 1:
+            discs.append(torch.stack([torch.abs(pair[0](feat) - pair[1](feat))
+                                      for pair in heads], 0).mean(0))
+        else:
+            # no pairs (plain M3SDA): spread across the per-domain heads
+            discs.append(torch.stack([h(feat) for h in flat_heads(heads)],
+                                     0).std(0))
 
     pseudo = torch.cat(means).cpu().numpy()
     disc = torch.cat(discs).cpu().numpy()
@@ -347,25 +375,29 @@ def next_batch(it, loader):
 def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
               val_loader, normalizer, device, args, n_epochs, epoch_offset,
               phase, pseudo_loader=None):
-    """
-    Training Phase
+    """One training phase.
 
     `src_loaders` holds one loader per source animal in balanced/pairs mode and
     a single pooled loader in combine mode. The epoch is driven by the longest
     source loader; shorter animals are cycled, so every animal contributes the
     same number of samples per step regardless of recording length.
 
-    identical metric names in all phases as well as epoch counter
-    metric phase marks beginn self-training
+    Metric names are identical in both phases and the epoch counter continues
+    across them, so every MLflow curve is continuous over the whole run; the
+    `phase` metric marks where the self-training round starts.
     """
     metrics = None
     trg_iter = iter(trg_loader) if args.MCD_activated else None
     pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
     head_params = [p for h in flat_heads(heads) for p in h.parameters()]
 
-    # pairs mode: one head pair per source animal, so each pair sees only its
-    # own animal in Step A. Otherwise the single pair sees every animal.
+    # pairs mode: one head group per source animal, so each group sees only its
+    # own animal in Step A. Otherwise the single group sees every animal.
     paired = len(heads) == len(src_loaders) and len(heads) > 1
+    # M3SDA's moment matching needs a target batch even when MCD is off
+    use_md = args.md_weight > 0.0
+    if use_md and trg_iter is None:
+        trg_iter = iter(trg_loader)
 
     steps_per_epoch = max(len(l) for l in src_loaders)
 
@@ -382,7 +414,7 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             da_weight = min(1.0, (gstep - args.warmup_epochs) / 20.0)
 
         stats = {"mse1": 0.0, "mse2": 0.0, "st": 0.0, "dis": 0.0,
-                 "dis_s": 0.0, "vpen": 0.0, "n": 0, "nb": 0}
+                 "dis_s": 0.0, "vpen": 0.0, "md": 0.0, "n": 0, "nb": 0}
 
         src_iters = [iter(l) for l in src_loaders]
 
@@ -394,7 +426,7 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             bsz = sum(x.size(0) for x in xs)
             sizes = [x.size(0) for x in xs]
 
-            if args.MCD_activated:
+            if args.MCD_activated or use_md:
                 (X_t, _), trg_iter = next_batch(trg_iter, trg_loader)
                 X_t = X_t.to(device)
 
@@ -410,21 +442,30 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             feats = torch.split(G(torch.cat(xs, 0)), sizes)
 
             if paired:
-                # each pair is trained only on its own animal, which is what
-                # makes the pairs genuinely different (M3SDA-beta's structure)
+                # each group is trained only on its own animal -- the N
+                # classifiers of M3SDA, Eq. 2's sum of per-domain losses
                 l1 = sum(F.mse_loss(hp[0](f), y)
                          for hp, f, y in zip(heads, feats, ys)) / len(heads)
-                l2 = sum(F.mse_loss(hp[1](f), y)
+                l2 = sum(F.mse_loss(hp[-1](f), y)
                          for hp, f, y in zip(heads, feats, ys)) / len(heads)
             else:
-                # the single pair sees every animal; mean over animals rather
+                # the single group sees every animal; mean over animals rather
                 # than over pooled samples, so a long recording cannot dominate
-                F1, F2 = heads[0]
+                F1, F2 = heads[0][0], heads[0][-1]
                 l1 = sum(F.mse_loss(F1(f), y) for f, y in zip(feats, ys)) / len(feats)
                 l2 = sum(F.mse_loss(F2(f), y) for f, y in zip(feats, ys)) / len(feats)
 
             loss_s1, loss_s2 = l1, l2
-            loss_stepA = loss_s1 + loss_s2
+            loss_stepA = loss_s1 + loss_s2 if len(heads[0]) > 1 else loss_s1
+
+            # ---- M3SDA: moment matching, Eq. 2's lambda * MD^2 term ----
+            if use_md:
+                # target forwarded separately so its batch statistics stay out
+                # of the source BatchNorm batch
+                md = moment_distance(feats, G(X_t), orders=args.md_orders,
+                                     source_source=bool(args.md_source_source))
+                loss_stepA = loss_stepA + args.md_weight * md
+                stats["md"] += float(md)
 
             # Pseudo-labelled target samples join the source loss, as the paper
             # describes: "used to train DRT again with source samples".
@@ -450,9 +491,6 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
             # ---- Steps B and C: MCD only ----
             if args.MCD_activated:
-                for h in flat_heads(heads):      # dropout off: the discrepancy
-                    h.eval()                      # must measure real disagreement
-
                 # Step B: heads maximise target discrepancy, backbone frozen.
                 for p in G.parameters():
                     p.requires_grad = False
@@ -468,15 +506,15 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
                         F.mse_loss(hp[0](f), y) + F.mse_loss(hp[1](f), y)
                         for hp, f, y in zip(heads, feats_d, ys)) / len(heads)
                 else:
-                    F1, F2 = heads[0]
+                    F1, F2 = heads[0][0], heads[0][1]
                     src_term = sum(F.mse_loss(F1(f), y) + F.mse_loss(F2(f), y)
                                    for f, y in zip(feats_d, ys)) / len(feats_d)
 
                 # every pair marks the support of its own animal; the generator
                 # must later pull the target inside all of them at once
-                dis = mean_discrepancy(heads, feat_t_d, args.disc_kind)
-                vpen = sum(variance_penalty(F1(feat_t_d), F2(feat_t_d))
-                           for F1, F2 in heads) / len(heads)
+                dis = mean_discrepancy(heads, feat_t_d)
+                vpen = sum(variance_penalty(p[0](feat_t_d), p[1](feat_t_d))
+                           for p in heads) / len(heads)
 
                 # Minimising a negative 'dis' term maximises the discrepancy
                 loss_stepB = src_term + da_weight * (args.gamma * vpen
@@ -494,9 +532,9 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
                 for _ in range(args.num_k):
                     feat_t = G(X_t)
-                    dis = mean_discrepancy(heads, feat_t, args.disc_kind)
-                    vpen = sum(variance_penalty(F1(feat_t), F2(feat_t))
-                               for F1, F2 in heads) / len(heads)
+                    dis = mean_discrepancy(heads, feat_t)
+                    vpen = sum(variance_penalty(p[0](feat_t), p[1](feat_t))
+                               for p in heads) / len(heads)
 
                     # Minimising positive 'dis' pulls the target inside the boundary
                     loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
@@ -509,22 +547,19 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
                 with torch.no_grad():
                     feat_s = G(torch.cat(xs, 0))
                     feat_t = G(X_t)
-                    stats["dis_s"] += float(mean_discrepancy(heads, feat_s,
-                                                             args.disc_kind))
-                    stats["dis"]   += float(mean_discrepancy(heads, feat_t,
-                                                             args.disc_kind))
+                    stats["dis_s"] += float(mean_discrepancy(heads, feat_s))
+                    stats["dis"]   += float(mean_discrepancy(heads, feat_t))
                     stats["vpen"]  += float(
-                        sum(variance_penalty(F1(feat_t), F2(feat_t))
-                            for F1, F2 in heads) / len(heads))
+                        sum(variance_penalty(p[0](feat_t), p[1](feat_t))
+                            for p in heads) / len(heads))
                 G.train()
-                for h in flat_heads(heads):
-                    h.train()
 
         sch_g.step(); sch_f.step()
 
         n, nb = max(stats["n"], 1), max(stats["nb"], 1)
-        # MMPD's w_k, recomputed each epoch from a few batches (cheap)
-        weights = mmpd_weights(G, heads, src_loaders, trg_loader, device, args)
+        # M3SDA's weighted ensemble: recomputed each epoch, cheap (a few batches)
+        weights = domain_weights(G, heads, src_loaders, trg_loader, device,
+                                 args.head_weighting, orders=args.md_orders)
         mae, rmse, r2, corr = evaluate(G, heads, val_loader, device, normalizer,
                                        weights)
         metrics = (mae, rmse, r2, corr)
@@ -543,9 +578,11 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             log["discrepancy_trg"] = stats["dis"] / nb
             log["discrepancy_ratio"] = stats["dis"]/ nb / (stats["dis_s"]/ nb + 1e-8)
             log["variance_penalty"] = stats["vpen"] / nb
+        if use_md:
+            log["moment_distance"] = stats["md"] / nb
         if weights is not None:
-            for k, w in enumerate(weights.tolist()):
-                log[f"source_weight_{k}"] = w
+            for i, w in enumerate(weights.tolist()):
+                log[f"domain_weight_{i}"] = w
         if pseudo_iter is not None:
             log["mse_pseudo"] = stats["st"] / n
         if args.DRT_activated:
@@ -607,12 +644,7 @@ def train(args):
     else:
         # one loader per animal; the per-animal batch size keeps the total
         # number of source samples per step at roughly args.batch_size
-        # MMPD underperformed when its source domains were small relative to
-        # the target, because each source-specific pair was then trained on too
-        # little data. --src_batch_per_domain keeps a usable batch per animal
-        # instead of splitting one batch four ways.
-        per = (args.src_batch_per_domain or
-               max(args.batch_size // len(source_domains), 2))
+        per = max(args.batch_size // len(source_domains), 2)
         src_loaders = [make_loader(normalizer.transform_X(Xs),
                                    normalizer.transform_Y(Ys), per)
                        for Xs, Ys in source_domains]
@@ -628,20 +660,23 @@ def train(args):
         basis_scale = args.basis_scale
     ).to(device)
 
-    # pairs: one head pair per source animal (M3SDA-beta's structure), so the
-    # pairs differ because the animals differ, not only because of the init
-    n_pairs = len(source_domains) if args.ms_mode == "pairs" else 1
-    heads = [(RegressorHead(hidden_dim=args.hidden_dim, dropout=args.head_dropout).to(device),
-              RegressorHead(hidden_dim=args.hidden_dim, dropout=args.head_dropout).to(device))
-             for _ in range(n_pairs)]
+    # pairs: one head group per source animal -- M3SDA's N classifiers. With
+    # n_heads=2 each group is a pair, which is what MCD's discrepancy needs
+    # (M3SDA-beta); with n_heads=1 it is plain M3SDA.
+    if args.MCD_activated and args.n_heads < 2:
+        raise ValueError("MCD needs --n_heads 2 (the discrepancy is between "
+                         "the two heads of a group)")
+    if args.md_weight > 0 and args.ms_mode == "combine":
+        print("  [warn] --md_weight > 0 with --ms_mode combine: the sources "
+              "are pooled, so the source-source term is empty")
+    n_groups = len(source_domains) if args.ms_mode == "pairs" else 1
+    heads = [tuple(RegressorHead(hidden_dim=args.hidden_dim).to(device)
+                   for _ in range(args.n_heads))
+             for _ in range(n_groups)]
 
-    head_ps = [p for h in flat_heads(heads) for p in h.parameters()]
-    if args.optimizer == "adam":
-        opt_g = optim.Adam(G.parameters(), lr=args.lr)
-        opt_f = optim.Adam(head_ps, lr=args.lr_f)
-    else:
-        opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
-        opt_f = optim.SGD(head_ps, lr=args.lr_f, momentum=0.9)
+    opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
+    opt_f = optim.SGD([p for h in flat_heads(heads) for p in h.parameters()],
+                      lr=args.lr_f, momentum=0.9)
 
     sch_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule,
                                            gamma=0.1)
@@ -666,14 +701,18 @@ def train(args):
             Xp, Yp, keep_rate, thr = make_pseudo_labels(
                 G, heads, trg_train_X, device, args.st_keep_quantile)
 
+            # mlflow.log_metrics({"st_keep_rate": keep_rate,
+            #                     "st_threshold": thr,
+            #                     "st_n_pseudo": float(len(Xp))},
+            #                    step=args.epochs)
             print(f"  [ST] kept {keep_rate:.1%} of target samples "
                   f"({len(Xp)} pseudo-labelled, thr={thr:.4f})")
 
             if len(Xp) > args.batch_size:
                 pseudo_loader = make_loader(Xp, Yp, args.batch_size)
 
-                # lower learning rate
-                # new scheduler with no milestones to stays constant
+                # Lower learning rate for the refinement round, and a fresh
+                # scheduler with no milestones so it stays constant.
                 for g in opt_g.param_groups:
                     g["lr"] = args.lr * args.st_lr_scale
                 for g in opt_f.param_groups:
@@ -698,7 +737,7 @@ def train(args):
 
 
         F1 = MeanHead([h[0] for h in heads]).to(device)
-        F2 = MeanHead([h[1] for h in heads]).to(device)
+        F2 = MeanHead([h[-1] for h in heads]).to(device)   # == F1 if n_heads=1
 
         if args.shap and args.seed == args.shap_seed:
             names = (args.feature_names.split(",") if args.feature_names
@@ -733,7 +772,7 @@ def train(args):
                 y_mean=float(normalizer.Y_mean),
                 y_std=float(normalizer.Y_std),
                 device=device,
-                out_path=f"pred_plots/{cfg}_{fold}_seed{args.seed}.png",
+                out_path=f"Old_Versions/pred_plots/{cfg}_{fold}_seed{args.seed}.png",
             )
 
         #PIs for t-sne
@@ -770,8 +809,8 @@ def parse_args():
     p.add_argument("--source_x_dicts", type=str, default="X_anim3.csv,X_anim4.csv,X_anim8.csv,X_anim10.csv")
     p.add_argument("--source_y_dicts", type=str, default="Y_anim3.csv,Y_anim4.csv,Y_anim8.csv,Y_anim10.csv")
 
-    p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training")
+    p.add_argument("--epochs", type=int, default=150) #150
+    p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training") #100
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
@@ -780,8 +819,6 @@ def parse_args():
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--schedule", type=int, nargs="+", default=[110, 135, 145])
     p.add_argument("--seed", type=int, default=100)
-    p.add_argument("--head_dropout", type=float, default=0,
-                   help="dropout in the regressor heads; 0 = off")
 
     # DRT
     p.add_argument("--K", type=int, default=4)
@@ -792,7 +829,7 @@ def parse_args():
     #MCD
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
-    p.add_argument("--ms_mode", type=str, default="combine",
+    p.add_argument("--ms_mode", type=str, default="balanced",
                    choices=["combine", "balanced", "pairs"],
                    help="combine: pooled source ;"
                         "balanced: one batch per animal, one head pair;"
@@ -800,23 +837,22 @@ def parse_args():
     p.add_argument("--num_k", type=int, default=1,
                    help="generator updates per batch in Step C (MCD's num_k)")
 
-    # MMPD 
-    p.add_argument("--mmpd", action="store_false",
-                   help="faithful MMPD preset: pairs + squared discrepancy, "
-                        "eta=1, no variance penalty, no warmup, Adam, "
-                        "weighted ensemble")
-    p.add_argument("--disc_kind", type=str, default="bounded",
-                   choices=["bounded", "l2"],
-                   help="bounded: 1-exp(-|d|); l2: MMPD's mean squared diff")
-    p.add_argument("--ens_mode", type=str, default="uniform",
-                   choices=["uniform", "mmpd"],
-                   help="mmpd: weight each source by 1/(error_k * dis_k)")
-    p.add_argument("--ens_beta", type=float, default=1.0,
-                   help="beta in MMPD Eq. 8; larger = peakier weights")
-    p.add_argument("--src_batch_per_domain", type=int, default=0,
-                   help="samples per animal per step; 0 = batch_size // M")
-    p.add_argument("--optimizer", type=str, default="sgd",
-                   choices=["sgd", "adam"])
+    # M3SDA
+    p.add_argument("--md_weight", type=float, default=0.5,
+                   help="lambda on the moment distance MD^2 (paper: 0.5, "
+                        "stable in 0.1-1); 0 disables moment matching")
+    p.add_argument("--md_orders", type=int, default=2,
+                   help="highest moment matched (paper: 2)")
+    p.add_argument("--md_source_source", type=int, default=1,
+                   help="1: match sources with each other too (full MD^2); "
+                        "0: source-target only, the paper's S-T ablation")
+    p.add_argument("--n_heads", type=int, default=2, choices=[1, 2],
+                   help="heads per source domain; 2 is required for MCD "
+                        "(M3SDA-beta), 1 is plain M3SDA")
+    p.add_argument("--head_weighting", type=str, default="uniform",
+                   choices=["uniform", "moment", "discrepancy"],
+                   help="uniform: M3SDA*; moment/discrepancy: unsupervised "
+                        "stand-ins for the paper's accuracy-based weights")
 
     # self-training
     p.add_argument("--st_epochs", type=int, default=30)
@@ -837,17 +873,7 @@ def parse_args():
     p.add_argument("--shap_seed", type=int, default=100, help="only this seed gets SHAP")
     p.add_argument("--feature_names", type=str, default="", help="comma-separated, 14 names")
 
-    args = p.parse_args()
-
-    if args.mmpd:       # to replicate the MMPD paper
-        args.ms_mode = "pairs"
-        args.disc_kind = "l2"
-        args.ens_mode = "mmpd"
-        args.eta = 1.0
-        args.gamma = 0.0
-        args.warmup_epochs = 0
-        args.optimizer = "adam"
-    return args
+    return p.parse_args()
 
 def main():
 
@@ -949,7 +975,7 @@ def main():
                                 "mean_raw_R2": float(np.mean(all_target_r2_raw_means)),
                                 "mean_Corr": float(np.mean(all_target_corr_means))})
 
-        output_file = "drt_training_results.txt"
+        output_file = "../drt_training_results.txt"
 
         with open(output_file, "a", encoding="utf-8") as f:
 

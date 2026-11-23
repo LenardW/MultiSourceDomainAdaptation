@@ -78,60 +78,14 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       drop_last=drop_last)
 
-def pool_segments(h, segments=None):
-    """Average the routing features over each set, then broadcast back.
-
-    `segments` lists the row counts the batch is made of (one entry per source
-    animal, in the order they were concatenated); None means the whole batch is
-    a single set. Rows are never reordered, so the same list is valid for every
-    layer of the backbone.
-    """
-    if segments is None:
-        return h.mean(0, keepdim=True).expand_as(h)
-    return torch.cat([p.mean(0, keepdim=True).expand_as(p)
-                      for p in torch.split(h, segments)], 0)
-
-def chunk_sizes(sizes, S):
-    """Split per-domain row counts into routing sets of S rows each.
-
-    sizes lists the rows each domain contributes to the batch, in concatenation
-    order. S > 1 splits every domain's rows into sets of S (a domain whose
-    batch is not a multiple of S ends with one shorter set); S == -1 keeps one
-    set per domain; S <= 1 means routing is per sample and segments are unused.
-    """
-    if S == -1:
-        return list(sizes)
-    if S <= 1:
-        return None
-    out = []
-    for n in sizes:
-        out += [S] * (n // S)
-        if n % S:
-            out.append(n % S)
-    return out
-
 class DynamicLinear(nn.Module):
-    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16, basis_scale=0.1,
-                 set_size=0):
+    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16, basis_scale=0.1):
         super().__init__()
         self.last_pi = None
-        self.last_lam = None
         self.K = K
         self.drt_activated = drt_activated
         self.in_dim = in_dim
         self.out_dim = out_dim
-
-        # per-set routing: one pi/Lambda for a whole set of samples instead of
-        # one per sample. `set_size` is how many rows share a routing vector;
-        # `segments` is set from outside only for a batch that concatenates
-        # several domains, and any batch whose length it does not match is
-        # chunked here instead, so a stale list can never be applied. `frozen`
-        # holds a routing vector computed once from a reference set, used at
-        # evaluation so a prediction does not depend on batch composition.
-        self.set_size = set_size
-        self.set_routing = set_size not in (0, 1)
-        self.segments = None
-        self.frozen = None
 
         #static component
         self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim))
@@ -167,23 +121,9 @@ class DynamicLinear(nn.Module):
 
 
         z0 = F.linear(x, self.static_weight)              # W_0 x, bias held back
-        if self.frozen is not None:
-            # routing fixed from a reference set
-            lam = self.frozen[0].to(x.device).expand(x.size(0), -1)
-            pi  = self.frozen[1].to(x.device).expand(x.size(0), -1)
-        else:
-            h = self.branch(x)
-            if self.set_routing:
-                # every row of a set gets the same W(x), so pi/Lambda describe
-                # the set (animal, regime) rather than the single beat
-                seg = self.segments
-                if seg is None or sum(seg) != x.size(0):
-                    # a batch from a single domain: chunk it here
-                    seg = chunk_sizes([x.size(0)], self.set_size)
-                h = pool_segments(h, seg)
-            lam = torch.sigmoid(self.to_lambda(h))       # [B, out_dim]
-            pi  = torch.softmax(self.to_pi(h), dim=-1)    # [B, K]
-        self.last_lam = lam.detach()
+        h = self.branch(x)
+        lam = torch.sigmoid(self.to_lambda(h))           # [B, out_dim]
+        pi  = torch.softmax(self.to_pi(h), dim=-1)        # [B, K]
         self.last_pi = pi.detach()
 
         # Lambda(x) W_0 x  ==  lam * (W_0 x), since Lambda is diagonal
@@ -204,68 +144,18 @@ class DynamicLinear(nn.Module):
         # return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
 
 class DynamicBackbone(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True, basis_scale=0.1,
-                 set_size=0):
+    def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True, basis_scale=0.1):
         super().__init__()
-        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated, basis_scale=basis_scale,
-                                    set_size=set_size)
+        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
         self.bn1, self.relu1 = nn.BatchNorm1d(256), nn.ReLU()
 
-        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale,
-                                    set_size=set_size)
+        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
         self.bn2, self.relu2 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
-
-    def set_segments(self, segments):
-        """Routing sets of a batch that concatenates several domains.
-
-        None (or a list that does not match the batch length) lets each layer
-        chunk the batch by its own set size instead.
-        """
-        self.layer1.segments = segments
-        self.layer2.segments = segments
 
     def forward(self, x):
         h = self.relu1(self.bn1(self.layer1(x)))
         h = self.relu2(self.bn2(self.layer2(h)))
         return h
-
-@torch.no_grad()
-def freeze_routing(G, X_ref, device, n_rows=0, max_rows=8192):
-    """Fix pi/Lambda from one reference set for the forward passes that follow.
-
-    With per-set routing a batched forward would otherwise make each row's
-    weights depend on which other rows share its batch, exactly like BatchNorm
-    in train mode. Evaluation, pseudo-labelling and the post-hoc tools instead
-    use a single routing vector computed over a reference set (the target
-    animal's unlabelled rows).
-
-    n_rows > 0 estimates it from that many rows, evenly spaced over the whole
-    recording, so the estimate carries the same sampling noise as the sets the
-    router was trained on; n_rows == 0 uses the whole reference set.
-    """
-    layers = [G.layer1, G.layer2]
-    if not layers[0].drt_activated:
-        return
-    was_training = G.training
-    G.eval()
-    for m in layers:
-        m.frozen = None
-    X = torch.as_tensor(X_ref, dtype=torch.float32)
-    if 0 < n_rows < len(X):
-        X = X[torch.linspace(0, len(X) - 1, n_rows).long()]   # deterministic
-    else:
-        X = X[:max_rows]
-    G.set_segments([len(X)])                 # the reference is ONE set
-    G(X.to(device))
-    G.set_segments(None)
-    for m in layers:
-        m.frozen = (m.last_lam[:1].clone(), m.last_pi[:1].clone())
-    if was_training:
-        G.train()
-
-def unfreeze_routing(G):
-    G.layer1.frozen = None
-    G.layer2.frozen = None
 
 class RegressorHead(nn.Module):
     def __init__(self, hidden_dim=128, dropout=0.0):
@@ -477,13 +367,6 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
     # own animal in Step A. Otherwise the single pair sees every animal.
     paired = len(heads) == len(src_loaders) and len(heads) > 1
 
-    # DRT routing granularity: S rows share one W(x). 0/1 is per sample.
-    S = args.routing_set_size
-    routing_on = S not in (0, 1)
-    # rows the frozen estimate is built from at evaluation: the same count as a
-    # training set (match) or the whole reference (full, and always for S == -1)
-    eval_rows = 0 if args.routing_eval == "full" else max(S, 0)
-
     steps_per_epoch = max(len(l) for l in src_loaders)
 
     for epoch in range(1, n_epochs + 1):
@@ -524,9 +407,7 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             # ONE forward pass over all animals: separate passes would give each
             # animal its own BatchNorm statistics, i.e. unintended per-domain
             # normalisation.
-            G.set_segments(chunk_sizes(sizes, S))   # sets within each animal
             feats = torch.split(G(torch.cat(xs, 0)), sizes)
-            G.set_segments(None)       # single-domain batches chunk themselves
 
             if paired:
                 # each pair is trained only on its own animal, which is what
@@ -578,10 +459,8 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
                 for p in head_params:
                     p.requires_grad = True
 
-                G.set_segments(chunk_sizes(sizes, S))
                 feats_d = [f.detach() for f in
                            torch.split(G(torch.cat(xs, 0)), sizes)]
-                G.set_segments(None)
                 feat_t_d = G(X_t).detach()
 
                 if paired:
@@ -628,9 +507,7 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
                 G.eval()
                 with torch.no_grad():
-                    G.set_segments(chunk_sizes(sizes, S))
                     feat_s = G(torch.cat(xs, 0))
-                    G.set_segments(None)
                     feat_t = G(X_t)
                     stats["dis_s"] += float(mean_discrepancy(heads, feat_s,
                                                              args.disc_kind))
@@ -648,15 +525,8 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
         n, nb = max(stats["n"], 1), max(stats["nb"], 1)
         # MMPD's w_k, recomputed each epoch from a few batches (cheap)
         weights = mmpd_weights(G, heads, src_loaders, trg_loader, device, args)
-        if routing_on:
-            # routing from the unlabelled adaptation split, not from the val
-            # batches, so the score does not depend on batch composition
-            freeze_routing(G, trg_loader.dataset.tensors[0], device,
-                           n_rows=eval_rows)
         mae, rmse, r2, corr = evaluate(G, heads, val_loader, device, normalizer,
                                        weights)
-        if routing_on:
-            unfreeze_routing(G)
         metrics = (mae, rmse, r2, corr)
 
         log = {
@@ -733,7 +603,6 @@ def train(args):
     # Dataloader trg_train_Y not used
     if args.ms_mode == "combine":
         # single pooled source domain -- the setting the MCD paper describes
-        per = args.batch_size
         src_loaders = [make_loader(X_src_n, Y_src_n, args.batch_size)]
     else:
         # one loader per animal; the per-animal batch size keeps the total
@@ -751,25 +620,12 @@ def train(args):
     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
                              shuffle=False, drop_last=False)
 
-    S = args.routing_set_size
-    routing_on = S not in (0, 1)
-    eval_rows = 0 if args.routing_eval == "full" else max(S, 0)
-    if routing_on:
-        if args.ms_mode == "combine":
-            print("  [warn] --routing_set_size with --ms_mode combine: the source "
-                  "batch mixes animals, so one set spans several of them")
-        if S > per:
-            print(f"  [warn] --routing_set_size {S} exceeds the {per} source rows "
-                  f"per animal per step, so sets are cut to {per} "
-                  f"(raise --src_batch_per_domain)")
-
     G = DynamicBackbone(
         in_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         K= args.K,
         drt_activated=args.DRT_activated,
-        basis_scale = args.basis_scale,
-        set_size=S,
+        basis_scale = args.basis_scale
     ).to(device)
 
     # pairs: one head pair per source animal (M3SDA-beta's structure), so the
@@ -807,12 +663,8 @@ def train(args):
 
         #Phase 2: self-training
         if args.ST_activated:
-            if routing_on:
-                freeze_routing(G, trg_train_X, device, n_rows=eval_rows)
             Xp, Yp, keep_rate, thr = make_pseudo_labels(
                 G, heads, trg_train_X, device, args.st_keep_quantile)
-            if routing_on:
-                unfreeze_routing(G)
 
             print(f"  [ST] kept {keep_rate:.1%} of target samples "
                   f"({len(Xp)} pseudo-labelled, thr={thr:.4f})")
@@ -844,10 +696,6 @@ def train(args):
         # --------------------------
         # one seed SHAP Values
 
-        # per-set routing: fix pi/Lambda from the whole target animal, so SHAP
-        # perturbations and the plots act on the static path with fixed weights
-        if routing_on:
-            freeze_routing(G, target_X_n, device, n_rows=eval_rows)
 
         F1 = MeanHead([h[0] for h in heads]).to(device)
         F2 = MeanHead([h[1] for h in heads]).to(device)
@@ -876,7 +724,7 @@ def train(args):
             fold = args.target_x_dict.replace("X_", "").replace(".csv", "")
             cfg = (f"mcd{int(args.MCD_activated)}drt{int(args.DRT_activated)}"
                    f"st{int(args.ST_activated)}")
-            os.makedirs("pred_plots", exist_ok=True)
+            os.makedirs("Old_Versions/pred_plots", exist_ok=True)
             plot_fold(
                 G, F1, F2,
                 X=target_X_n,            # full animal, unshuffled -> row order = time
@@ -885,16 +733,10 @@ def train(args):
                 y_mean=float(normalizer.Y_mean),
                 y_std=float(normalizer.Y_std),
                 device=device,
-                out_path=f"pred_plots/{cfg}_{fold}_seed{args.seed}.png",
+                out_path=f"Old_Versions/pred_plots/{cfg}_{fold}_seed{args.seed}.png",
             )
 
         #PIs for t-sne
-        # back to live routing: the dump compares pi ACROSS domains, so each
-        # domain must compute its own (one vector per set under
-        # --routing_set_size, one per sample otherwise)
-        if routing_on:
-            unfreeze_routing(G)
-
         if args.pi_dump_dir and args.DRT_activated:
             names = [args.target_x_dict] + args.source_x_dicts.split(",")
             names = [n.replace("X_", "").replace(".csv", "") for n in names]
@@ -944,16 +786,6 @@ def parse_args():
     # DRT
     p.add_argument("--K", type=int, default=4)
     p.add_argument("--basis_scale", type=float, default=0.1, help="init scale of the Phi_i basis matrices")
-    p.add_argument("--routing_set_size", type=int, default=0,
-                   help="rows of one animal that share a DRT routing vector: "
-                        "0 or 1 = one pi/Lambda per sample (unchanged "
-                        "behaviour), S > 1 = one per S rows, -1 = one per "
-                        "per-domain batch. Capped by --src_batch_per_domain.")
-    p.add_argument("--routing_eval", type=str, default="match",
-                   choices=["match", "full"],
-                   help="frozen routing at evaluation: estimate it from as many "
-                        "rows as a training set (match) or from the whole "
-                        "reference set (full; also used when S == -1)")
     p.add_argument("--pi_dump_dir", type=str, default="pi_dumps")
     p.add_argument("--pi_max_per_domain", type=int, default=2000)
 
@@ -968,8 +800,8 @@ def parse_args():
     p.add_argument("--num_k", type=int, default=1,
                    help="generator updates per batch in Step C (MCD's num_k)")
 
-    # MMPD
-    p.add_argument("--mmpd", action="store_true",
+    # MMPD 
+    p.add_argument("--mmpd", action="store_false",
                    help="faithful MMPD preset: pairs + squared discrepancy, "
                         "eta=1, no variance penalty, no warmup, Adam, "
                         "weighted ensemble")
@@ -1036,8 +868,8 @@ def main():
 
     # MCD DRT ST
     allowed_values = [
-        # (False, False, False),
-        # (False, True, False),
+        (False, False, False),
+        (False, True, False),
         (True, False, False),
         (True, True, False),
         (True, True, True)

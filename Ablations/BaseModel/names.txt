@@ -1,0 +1,14 @@
+Pressure head–flow ratio
+Motor power–LV pressure ratio
+Pulsatile flow integral
+Total flow integral
+Pulsatile current integral
+Total current integral
+Mean pump speed
+Mean pressure head
+Minimum pressure head
+Maximum pressure head
+Maximum flow acceleration
+Maximum flow deceleration
+Smoothed max. flow acceleration
+Smoothed max. flow deceleration

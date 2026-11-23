@@ -62,12 +62,34 @@ class Normalizer:
     def inverse_Y(self, Y_norm):
         return Y_norm * self.Y_std + self.Y_mean
 
-def split_domain(X, Y, val_ratio=0.2, seed=100):
+def make_windows(X, Y, L):
+    """Causal sliding windows over ONE animal's beats (rows in time order).
 
+    X: (T, C) -> (T-L+1, C, L), channels first as Conv1d expects.
+    Y: (T,)   -> (T-L+1,), strokework of the LAST beat of each window, so the
+    model sees only the current and past beats. The first L-1 beats of an
+    animal get no prediction. Never call this on concatenated animals.
+    """
+    Xw = np.lib.stride_tricks.sliding_window_view(X, L, axis=0)  # (T-L+1, C, L)
+    return np.ascontiguousarray(Xw, dtype=np.float32), Y[L - 1:]
+
+def split_domain(X, Y, val_ratio=0.2, seed=100, mode="random", gap=0):
+    """Split the target windows into the unlabelled adaptation set and val.
+
+    random: as before. Neighbouring windows overlap, so val beats also appear
+            inside adaptation windows -- but target labels never enter
+            training, so this shares inputs, not labels (transductive DA).
+    block:  the last val_ratio of the recording is val, and `gap` windows
+            before it are dropped, so the two sets share no beat at all.
+    """
     n = len(X)
-    idx = np.random.default_rng(seed).permutation(n)
     n_val = int(n * val_ratio)
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
+    if mode == "block":
+        val_idx = np.arange(n - n_val, n)
+        train_idx = np.arange(0, max(n - n_val - gap, 0))
+    else:
+        idx = np.random.default_rng(seed).permutation(n)
+        val_idx, train_idx = idx[:n_val], idx[n_val:]
     return (X[train_idx], Y[train_idx]), (X[val_idx], Y[val_idx])
 
 def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
@@ -78,29 +100,45 @@ def make_loader(X, Y, batch_size, shuffle=True, drop_last=True):
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       drop_last=drop_last)
 
-class DynamicLinear(nn.Module):
-    def __init__(self, in_dim, out_dim, K=4, reduction=16, drt_activated=True, min_hidden=16, basis_scale=0.1):
+class DynamicConv1d(nn.Module):
+    """DRT dynamic layer as a causal convolution over the beat axis.
+
+        W(x) = W_0 + Lambda(x) W_0 + sum_i pi_i(x) Phi_i        (paper, Eq. 5)
+
+    Input (B, C_in, L) -> output (B, C_out, L-k+1). 'Valid' convolution: output
+    position t sees beats t-k+1..t only, and no padding is involved.
+
+    Paper, Fig. 3: Lambda(x) and pi(x) come from ONE branch fed by the input
+    average-pooled over time, so routing is a property of the whole window.
+
+    Official code (model/resnet_dra.py, BottleneckKDRA): the bases Phi_i are
+    1-wide kernels running parallel to the static k-wide kernel, and there is
+    no Lambda(x) term (SEModule is defined but never used). phi_kernel=1 is
+    that default here, aligned on the most recent beat of W_0's field;
+    """
+    def __init__(self, in_dim, out_dim, kernel_size=3, phi_kernel=1, K=4,
+                 reduction=16, drt_activated=True, min_hidden=16,
+                 basis_scale=0.1):
         super().__init__()
+        assert 1 <= phi_kernel <= kernel_size
         self.last_pi = None
         self.K = K
         self.drt_activated = drt_activated
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.k, self.k_phi = kernel_size, phi_kernel
 
-        #static component
-        self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim))
+        #static component: W_0 is a (C_out, C_in, k) temporal kernel
+        self.static_weight = nn.Parameter(torch.Tensor(out_dim, in_dim, kernel_size))
         self.static_bias = nn.Parameter(torch.Tensor(out_dim))
         nn.init.kaiming_uniform_(self.static_weight, a=np.sqrt(5))
         nn.init.zeros_(self.static_bias)
 
-        # basis matrices for subspace routing
-        self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim))
+        # basis kernels for subspace routing: Phi_i is (C_out, C_in, k_phi)
+        self.residual_weights = nn.Parameter(torch.Tensor(K, out_dim, in_dim, phi_kernel))
         # Small but non-zero and mutually distinct. With Phi_k == 0 the router
         # gets exactly zero gradient on the first step, and all K bases receive
         # identical gradients thereafter, which drives them together.
-
-
-        # nn.init.zeros_(self.residual_weights)
         with torch.no_grad():
             for k in range(K):
                 nn.init.kaiming_uniform_(self.residual_weights[k], a=np.sqrt(5))
@@ -108,54 +146,68 @@ class DynamicLinear(nn.Module):
 
         # ONE shared lightweight branch feeds both Λ(x) and π(x),
         # mirroring the single attention branch in the paper's Fig. 3
-        #hidden = max(in_dim // reduction, 4)
         hidden = min(max(in_dim // reduction, min_hidden), in_dim) # first layer get 14, second gets 16
         self.branch = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
-        self.to_lambda = nn.Linear(hidden, out_dim)   # -> sigmoid, Λ(x)
-        self.to_pi     = nn.Linear(hidden, K)          # -> softmax, π(x)
+        self.to_lambda = nn.Linear(hidden, out_dim)  # -> sigmoid, Λ(x)
+        self.to_pi     = nn.Linear(hidden, K)                                 # -> softmax, π(x)
 
-    def forward(self, x):
+    def forward(self, x):                                  # x: [B, C_in, L]
         if not self.drt_activated:
             self.last_pi = None
-            return F.linear(x, self.static_weight, self.static_bias)
+            return F.conv1d(x, self.static_weight, self.static_bias)  # conv instead of a linear one
 
-
-        z0 = F.linear(x, self.static_weight)              # W_0 x, bias held back
-        h = self.branch(x)
-        lam = torch.sigmoid(self.to_lambda(h))           # [B, out_dim]
-        pi  = torch.softmax(self.to_pi(h), dim=-1)        # [B, K]
+        z0 = F.conv1d(x, self.static_weight)               # W_0 * x, bias held back
+        h = self.branch(x.mean(dim=-1))                    # global average pool over time
+        lam = torch.sigmoid(self.to_lambda(h))              # [B, C_out]
+        pi = torch.softmax(self.to_pi(h), dim=-1)          # [B, K]
         self.last_pi = pi.detach()
 
-        # Lambda(x) W_0 x  ==  lam * (W_0 x), since Lambda is diagonal
-        out = z0 + lam * z0
+        # Lambda(x) W_0 * x == lam * (W_0 * x), since Lambda is diagonal
+        out = z0 + lam.unsqueeze(-1) * z0 # .unsqueeze(-1) because of time dim
 
-        # all K projections in one GEMM: [B, K*out] -> [B, K, out]
-        z = F.linear(x, self.residual_weights.reshape(self.K * self.out_dim,
-                                                      self.in_dim))
-        z = z.view(-1, self.K, self.out_dim)
-        out = out + (z * pi.unsqueeze(-1)).sum(dim=1)
+        # all K bases in one conv: [B, K*C_out, L-k_phi+1] -> now con instead of linear
+        z = F.conv1d(x, self.residual_weights.reshape(
+            self.K * self.out_dim, self.in_dim, self.k_phi))
+        z = z[..., self.k - self.k_phi:]                   # align with W_0's output positions
+        z = z.reshape(z.size(0), self.K, self.out_dim, -1)
+        out = out + (z * pi[:, :, None, None]).sum(dim=1)
 
-        return out + self.static_bias
-
-        # lam_term = lam.unsqueeze(-1) * self.static_weight.unsqueeze(0)     # Λ(x)W_0, per sample
-        # pi_term  = torch.einsum('bk,kij->bij', pi, self.residual_weights)  # Σπ_i(x)Φ_i
-        #
-        # weight = self.static_weight.unsqueeze(0) + lam_term + pi_term
-        # return torch.bmm(weight, x.unsqueeze(-1)).squeeze(-1) + self.static_bias
+        return out + self.static_bias.unsqueeze(-1)
 
 class DynamicBackbone(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True, basis_scale=0.1):
+    """Two dynamic temporal conv layers. A window's feature vector is the
+    output at its last beat. Receptive field: 1 + 2*(kernel_size-1) beats."""
+    def __init__(self, in_dim=14, hidden_dim=128, K=4, drt_activated=True, basis_scale=0.1,
+                 kernel_size=3, phi_kernel=1):
         super().__init__()
-        self.layer1 = DynamicLinear(in_dim, 256, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
+        kw = dict(K=K, drt_activated=drt_activated, basis_scale=basis_scale,
+                  kernel_size=kernel_size, phi_kernel=phi_kernel)
+        self.receptive_field = 1 + 3 * (kernel_size - 1)
+
+        self.layer1 = DynamicConv1d(in_dim, 256, **kw)
         self.bn1, self.relu1 = nn.BatchNorm1d(256), nn.ReLU()
 
-        self.layer2 = DynamicLinear(256, hidden_dim, K=K, drt_activated=drt_activated, basis_scale=basis_scale)
+        self.layer2 = DynamicConv1d(256, hidden_dim, **kw)
         self.bn2, self.relu2 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
 
+        self.layer3 = DynamicConv1d(hidden_dim, hidden_dim, **kw)
+        self.bn3, self.relu3 = nn.BatchNorm1d(hidden_dim), nn.ReLU()
+
+    def forward(self, x):                                  # x: [B, C_in, L]
+        h = self.relu1(self.bn1(self.layer1(x)))           # [B, 256, L-k+1]
+        h = self.relu2(self.bn2(self.layer2(h)))           # [B, hidden, L-2k+2]
+        h = self.relu3(self.bn3(self.layer3(h)))
+        return h[..., -1]                                  # last beat -> [B, hidden]
+
+class FlatWindow(nn.Module):
+    """Lets flat-row tools like KernelSHAP call the temporal backbone:
+    [B, C*L] -> [B, C, L] -> G."""
+    def __init__(self, G, C, L):
+        super().__init__()
+        self.G, self.C, self.L = G, C, L
+
     def forward(self, x):
-        h = self.relu1(self.bn1(self.layer1(x)))
-        h = self.relu2(self.bn2(self.layer2(h)))
-        return h
+        return self.G(x.reshape(-1, self.C, self.L))
 
 class RegressorHead(nn.Module):
     def __init__(self, hidden_dim=128):
@@ -169,106 +221,6 @@ class RegressorHead(nn.Module):
     def forward(self, feat):
         return self.net(feat).squeeze(-1)
 
-class MeanHead(nn.Module):
-    """Averages several heads into one callable head.
-
-    Only used so that tools expecting a single (F1, F2) pair -- SHAP, the
-    prediction plots -- keep working in `pairs` mode, where there is one head
-    pair per source animal.
-    """
-    def __init__(self, heads):
-        super().__init__()
-        self.heads = nn.ModuleList(heads)
-
-    def forward(self, feat):
-        return torch.stack([h(feat) for h in self.heads], 0).mean(0)
-
-def flat_heads(heads):
-    """[(F1, F2), ...] -> flat list of every head."""
-    return [h for pair in heads for h in pair]
-
-def ensemble(heads, feat, weights=None):
-    """Prediction of the ensemble.
-
-    Each source domain contributes the mean of its own heads; the domains are
-    then combined with `weights` (M3SDA's W) or uniformly (M3SDA*).
-    """
-    per_domain = torch.stack([torch.stack([h(feat) for h in pair], 0).mean(0)
-                              for pair in heads], 0)          # [n_dom, B]
-    if weights is None:
-        return per_domain.mean(0)
-    return (per_domain * weights.to(per_domain.device).view(-1, 1)).sum(0)
-
-def mean_discrepancy(heads, feat):
-    """Mean over domains of the within-pair discrepancy."""
-    return sum(discrepancy_loss(pair[0](feat), pair[1](feat))
-               for pair in heads) / len(heads)
-
-def moment_distance(feats, feat_t, orders=2, source_source=True):
-    """M3SDA's moment distance MD^2 (paper Eq. 1).
-
-    `feats` is one feature batch per source animal, `feat_t` the target batch.
-    For each order k the first term matches E[X^k] of every source against the
-    target; the second matches the sources against each other. The paper's
-    central claim is that the target cannot be aligned with every source while
-    the sources are not aligned among themselves, and their ablation shows the
-    source-source term adds on top of the source-target one.
-
-    Note this is estimated from the batch, so the second moment is noisy at
-    small per-animal batch sizes.
-    """
-    n = len(feats)
-    md = feat_t.new_zeros(())
-    for k in range(1, orders + 1):
-        ms = [(f ** k).mean(0) for f in feats]
-        mt = (feat_t ** k).mean(0)
-        md = md + sum((m - mt).norm() for m in ms) / n          # source <-> target
-        if source_source and n > 1:
-            ij = [(i, j) for i in range(n) for j in range(i + 1, n)]
-            md = md + sum((ms[i] - ms[j]).norm() for i, j in ij) / len(ij)
-    return md
-
-@torch.no_grad()
-def domain_weights(G, heads, src_loaders, trg_loader, device, mode,
-                   max_batches=8, orders=2):
-    """Per-domain ensemble weights W (M3SDA's weighted schema).
-
-    The paper sets w_i from the source-only accuracy of domain i on the target,
-    which needs target labels. Two unsupervised stand-ins, both expressing how
-    close a source is to the target:
-      moment      w_i proportional to 1 / MD^2(D_i, D_T)
-      discrepancy w_i proportional to 1 / mean target discrepancy of pair i
-    Returns None for uniform weighting (M3SDA*) or a single domain.
-    """
-    if mode == "uniform" or len(heads) < 2:
-        return None
-
-    G.eval()
-    for h in flat_heads(heads):
-        h.eval()
-
-    scores = torch.zeros(len(heads))
-    nb = 0
-    trg_iter = iter(trg_loader)
-    src_iters = [iter(l) for l in src_loaders]
-
-    for _ in range(max_batches):
-        (X_t, _), trg_iter = next_batch(trg_iter, trg_loader)
-        feat_t = G(X_t.to(device))
-        for i, loader in enumerate(src_loaders):
-            (X_i, _), src_iters[i] = next_batch(src_iters[i], loader)
-            if mode == "moment":
-                feat_i = G(X_i.to(device))
-                scores[i] += float(moment_distance([feat_i], feat_t, orders,
-                                                   source_source=False))
-            else:   # discrepancy
-                scores[i] += float(discrepancy_loss(heads[i][0](feat_t),
-                                                    heads[i][1](feat_t)))
-        nb += 1
-
-    w = 1.0 / (scores / max(nb, 1) + 1e-8)
-    return w / w.sum()
-
 def discrepancy_loss(pred1, pred2):
     return torch.mean(1.0 - torch.exp(-torch.abs(pred1 - pred2)))
 # def discrepancy_loss(pred1, pred2, kind="bounded"):
@@ -280,18 +232,20 @@ def variance_penalty(pred1, pred2):
 
 
 @torch.no_grad()
-def evaluate(G, heads, loader, device, normalizer, weights=None):
+def evaluate(G, F1, F2, loader, device, normalizer):
     G.eval()
-    for h in flat_heads(heads):
-        h.eval()
+    #Router.eval()
+    F1.eval()
+    F2.eval()
 
     preds, targets = [], []
 
     for X_b, Y_b in loader:
         X_b, Y_b = X_b.to(device), Y_b.to(device)
         feat = G(X_b)
-        # ensemble over the per-domain heads, uniform (M3SDA*) or weighted
-        pred = ensemble(heads, feat, weights)
+        #sub1, sub2 = Router(feat)
+        # ensemble: average of the two heads
+        pred = (F1(feat) + F2(feat)) / 2.0
         preds.append(pred.cpu())
         targets.append(Y_b.cpu())
 
@@ -326,7 +280,7 @@ def basis_similarity(layer):
     return float(off.mean())
 
 @torch.no_grad()
-def make_pseudo_labels(G, heads, X_trg, device, keep_quantile):
+def make_pseudo_labels(G, F1, F2, X_trg, device, keep_quantile):
     """
     One-shot pseudo-labelling of the unlabelled target split.
 
@@ -340,47 +294,25 @@ def make_pseudo_labels(G, heads, X_trg, device, keep_quantile):
     The threshold is a quantile of the observed discrepancy rather than an
     absolute number, so the keep rate is stable across animals and scales.
     """
-    G.eval()
-    for h in flat_heads(heads):
-        h.eval()
+    G.eval(); F1.eval(); F2.eval()
     Xt = torch.tensor(X_trg, dtype=torch.float32).to(device)
 
-    means, discs = [], []
+    p1s, p2s = [], []
     for i in range(0, len(Xt), 512):
         feat = G(Xt[i:i + 512])
-        means.append(ensemble(heads, feat))
-        # confidence: mean within-pair disagreement over all pairs
-        if len(heads[0]) > 1:
-            discs.append(torch.stack([torch.abs(pair[0](feat) - pair[1](feat))
-                                      for pair in heads], 0).mean(0))
-        else:
-            # no pairs (plain M3SDA): spread across the per-domain heads
-            discs.append(torch.stack([h(feat) for h in flat_heads(heads)],
-                                     0).std(0))
+        p1s.append(F1(feat)); p2s.append(F2(feat))
+    p1, p2 = torch.cat(p1s), torch.cat(p2s)
 
-    pseudo = torch.cat(means).cpu().numpy()
-    disc = torch.cat(discs).cpu().numpy()
+    pseudo = ((p1 + p2) / 2.0).cpu().numpy()
+    disc = torch.abs(p1 - p2).cpu().numpy()
     thr = float(np.quantile(disc, keep_quantile))
     keep = disc <= thr
     return X_trg[keep], pseudo[keep], float(keep.mean()), thr
 
-def next_batch(it, loader):
-    """Next batch from a cycling iterator; returns the batch and the iterator."""
-    try:
-        return next(it), it
-    except StopIteration:
-        it = iter(loader)
-        return next(it), it
-
-def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
+def run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f, src_loader, trg_loader,
               val_loader, normalizer, device, args, n_epochs, epoch_offset,
               phase, pseudo_loader=None):
     """One training phase.
-
-    `src_loaders` holds one loader per source animal in balanced/pairs mode and
-    a single pooled loader in combine mode. The epoch is driven by the longest
-    source loader; shorter animals are cycled, so every animal contributes the
-    same number of samples per step regardless of recording length.
 
     Metric names are identical in both phases and the epoch counter continues
     across them, so every MLflow curve is continuous over the whole run; the
@@ -389,23 +321,11 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
     metrics = None
     trg_iter = iter(trg_loader) if args.MCD_activated else None
     pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
-    head_params = [p for h in flat_heads(heads) for p in h.parameters()]
-
-    # pairs mode: one head group per source animal, so each group sees only its
-    # own animal in Step A. Otherwise the single group sees every animal.
-    paired = len(heads) == len(src_loaders) and len(heads) > 1
-    # M3SDA's moment matching needs a target batch even when MCD is off
-    use_md = args.md_weight > 0.0
-    if use_md and trg_iter is None:
-        trg_iter = iter(trg_loader)
-
-    steps_per_epoch = max(len(l) for l in src_loaders)
+    head_params = list(F1.parameters()) + list(F2.parameters())
 
     for epoch in range(1, n_epochs + 1):
         gstep = epoch_offset + epoch
-        G.train()
-        for h in flat_heads(heads):
-            h.train()
+        G.train(); F1.train(); F2.train()
 
         # Discrepancy warmup factor
         if gstep <= args.warmup_epochs:
@@ -414,20 +334,18 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             da_weight = min(1.0, (gstep - args.warmup_epochs) / 20.0)
 
         stats = {"mse1": 0.0, "mse2": 0.0, "st": 0.0, "dis": 0.0,
-                 "dis_s": 0.0, "vpen": 0.0, "md": 0.0, "n": 0, "nb": 0}
+                 "dis_s": 0.0, "vpen": 0.0, "n": 0, "nb": 0}
 
-        src_iters = [iter(l) for l in src_loaders]
+        for X_s, Y_s in src_loader:
+            bsz = X_s.size(0)
+            X_s, Y_s = X_s.to(device), Y_s.to(device)
 
-        for _ in range(steps_per_epoch):
-            xs, ys = [], []
-            for i, loader in enumerate(src_loaders):
-                (X_i, Y_i), src_iters[i] = next_batch(src_iters[i], loader)
-                xs.append(X_i.to(device)); ys.append(Y_i.to(device))
-            bsz = sum(x.size(0) for x in xs)
-            sizes = [x.size(0) for x in xs]
-
-            if args.MCD_activated or use_md:
-                (X_t, _), trg_iter = next_batch(trg_iter, trg_loader)
+            if args.MCD_activated:
+                try:
+                    X_t, _ = next(trg_iter)
+                except StopIteration:
+                    trg_iter = iter(trg_loader)
+                    X_t, _ = next(trg_iter)
                 X_t = X_t.to(device)
 
             # ---- Step A: supervised risk, plus pseudo-labelled target ----
@@ -436,46 +354,24 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             for p in head_params:
                 p.requires_grad = True
 
-            # ONE forward pass over all animals: separate passes would give each
-            # animal its own BatchNorm statistics, i.e. unintended per-domain
-            # normalisation.
-            feats = torch.split(G(torch.cat(xs, 0)), sizes)
-
-            if paired:
-                # each group is trained only on its own animal -- the N
-                # classifiers of M3SDA, Eq. 2's sum of per-domain losses
-                l1 = sum(F.mse_loss(hp[0](f), y)
-                         for hp, f, y in zip(heads, feats, ys)) / len(heads)
-                l2 = sum(F.mse_loss(hp[-1](f), y)
-                         for hp, f, y in zip(heads, feats, ys)) / len(heads)
-            else:
-                # the single group sees every animal; mean over animals rather
-                # than over pooled samples, so a long recording cannot dominate
-                F1, F2 = heads[0][0], heads[0][-1]
-                l1 = sum(F.mse_loss(F1(f), y) for f, y in zip(feats, ys)) / len(feats)
-                l2 = sum(F.mse_loss(F2(f), y) for f, y in zip(feats, ys)) / len(feats)
-
-            loss_s1, loss_s2 = l1, l2
-            loss_stepA = loss_s1 + loss_s2 if len(heads[0]) > 1 else loss_s1
-
-            # ---- M3SDA: moment matching, Eq. 2's lambda * MD^2 term ----
-            if use_md:
-                # target forwarded separately so its batch statistics stay out
-                # of the source BatchNorm batch
-                md = moment_distance(feats, G(X_t), orders=args.md_orders,
-                                     source_source=bool(args.md_source_source))
-                loss_stepA = loss_stepA + args.md_weight * md
-                stats["md"] += float(md)
+            feat_s = G(X_s)
+            loss_s1 = F.mse_loss(F1(feat_s), Y_s)
+            loss_s2 = F.mse_loss(F2(feat_s), Y_s)
+            loss_stepA = loss_s1 + loss_s2
 
             # Pseudo-labelled target samples join the source loss, as the paper
             # describes: "used to train DRT again with source samples".
             if pseudo_iter is not None:
-                (Xp, Yp), pseudo_iter = next_batch(pseudo_iter, pseudo_loader)
+                try:
+                    Xp, Yp = next(pseudo_iter)
+                except StopIteration:
+                    pseudo_iter = iter(pseudo_loader)
+                    Xp, Yp = next(pseudo_iter)
                 if Xp.size(0) > 1:
                     Xp, Yp = Xp.to(device), Yp.to(device)
                     feat_p = G(Xp)
-                    l_st = sum(F.mse_loss(h(feat_p), Yp)
-                               for h in flat_heads(heads)) / len(heads)
+                    l_st = (F.mse_loss(F1(feat_p), Yp)
+                            + F.mse_loss(F2(feat_p), Yp))
                     loss_stepA = loss_stepA + args.st_weight * l_st
                     stats["st"] += float(l_st) * bsz
 
@@ -497,28 +393,25 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
                 for p in head_params:
                     p.requires_grad = True
 
-                feats_d = [f.detach() for f in
-                           torch.split(G(torch.cat(xs, 0)), sizes)]
+                feat_s_d = G(X_s).detach()
                 feat_t_d = G(X_t).detach()
 
-                if paired:
-                    src_term = sum(
-                        F.mse_loss(hp[0](f), y) + F.mse_loss(hp[1](f), y)
-                        for hp, f, y in zip(heads, feats_d, ys)) / len(heads)
-                else:
-                    F1, F2 = heads[0][0], heads[0][1]
-                    src_term = sum(F.mse_loss(F1(f), y) + F.mse_loss(F2(f), y)
-                                   for f, y in zip(feats_d, ys)) / len(feats_d)
+                pred_s1, pred_s2 = F1(feat_s_d), F2(feat_s_d)
+                pred_t1, pred_t2 = F1(feat_t_d), F2(feat_t_d)
 
-                # every pair marks the support of its own animal; the generator
-                # must later pull the target inside all of them at once
-                dis = mean_discrepancy(heads, feat_t_d)
-                vpen = sum(variance_penalty(p[0](feat_t_d), p[1](feat_t_d))
-                           for p in heads) / len(heads)
+                dis = discrepancy_loss(pred_t1, pred_t2)
+                vpen = variance_penalty(pred_t1, pred_t2)
+
+                # stats["dis_s"] += float(discrepancy_loss(pred_s1, pred_s2).detach())
 
                 # Minimising a negative 'dis' term maximises the discrepancy
-                loss_stepB = src_term + da_weight * (args.gamma * vpen
-                                                     - args.eta * dis)
+                loss_stepB = (F.mse_loss(pred_s1, Y_s)
+                              + F.mse_loss(pred_s2, Y_s)
+                              + da_weight * (args.gamma * vpen
+                                             - args.eta * dis))
+                # loss_stepB = (F.mse_loss(pred_s1, Y_s)
+                #               + F.mse_loss(pred_s2, Y_s)
+                #               - da_weight * args.eta * dis)
 
                 opt_f.zero_grad()
                 loss_stepB.backward()
@@ -532,9 +425,10 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
                 for _ in range(args.num_k):
                     feat_t = G(X_t)
-                    dis = mean_discrepancy(heads, feat_t)
-                    vpen = sum(variance_penalty(p[0](feat_t), p[1](feat_t))
-                               for p in heads) / len(heads)
+                    pred_t1, pred_t2 = F1(feat_t), F2(feat_t)
+
+                    dis = discrepancy_loss(pred_t1, pred_t2)
+                    vpen = variance_penalty(pred_t1, pred_t2)
 
                     # Minimising positive 'dis' pulls the target inside the boundary
                     loss_stepC = da_weight * (args.eta * dis + args.gamma * vpen)
@@ -545,23 +439,17 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
 
                 G.eval()
                 with torch.no_grad():
-                    feat_s = G(torch.cat(xs, 0))
-                    feat_t = G(X_t)
-                    stats["dis_s"] += float(mean_discrepancy(heads, feat_s))
-                    stats["dis"]   += float(mean_discrepancy(heads, feat_t))
-                    stats["vpen"]  += float(
-                        sum(variance_penalty(p[0](feat_t), p[1](feat_t))
-                            for p in heads) / len(heads))
+                    p1s, p2s = F1(G(X_s)), F2(G(X_s))
+                    p1t, p2t = F1(G(X_t)), F2(G(X_t))
+                    stats["dis_s"] += float(discrepancy_loss(p1s, p2s))
+                    stats["dis"]   += float(discrepancy_loss(p1t, p2t))
+                    stats["vpen"]  += float(variance_penalty(p1t, p2t))
                 G.train()
 
         sch_g.step(); sch_f.step()
 
         n, nb = max(stats["n"], 1), max(stats["nb"], 1)
-        # M3SDA's weighted ensemble: recomputed each epoch, cheap (a few batches)
-        weights = domain_weights(G, heads, src_loaders, trg_loader, device,
-                                 args.head_weighting, orders=args.md_orders)
-        mae, rmse, r2, corr = evaluate(G, heads, val_loader, device, normalizer,
-                                       weights)
+        mae, rmse, r2, corr = evaluate(G, F1, F2, val_loader, device, normalizer)
         metrics = (mae, rmse, r2, corr)
 
         log = {
@@ -578,11 +466,6 @@ def run_phase(G, heads, opt_g, opt_f, sch_g, sch_f, src_loaders, trg_loader,
             log["discrepancy_trg"] = stats["dis"] / nb
             log["discrepancy_ratio"] = stats["dis"]/ nb / (stats["dis_s"]/ nb + 1e-8)
             log["variance_penalty"] = stats["vpen"] / nb
-        if use_md:
-            log["moment_distance"] = stats["md"] / nb
-        if weights is not None:
-            for i, w in enumerate(weights.tolist()):
-                log[f"domain_weight_{i}"] = w
         if pseudo_iter is not None:
             log["mse_pseudo"] = stats["st"] / n
         if args.DRT_activated:
@@ -624,30 +507,27 @@ def train(args):
     X_src_all = np.concatenate([X for X, Y in source_domains], axis=0)
     Y_src_all = np.concatenate([Y for X, Y in source_domains], axis=0)
 
-    # normalize on source only
+    # normalize on source only (per beat, before windowing)
     normalizer = Normalizer().fit(X_src_all, Y_src_all)
 
-    X_src_n = normalizer.transform_X(X_src_all)
-    Y_src_n = normalizer.transform_Y(Y_src_all)
+    # window each animal separately so that no window spans two animals;
+    # src_windows keeps raw Y per animal for dump_pi below
+    L = args.window
+    src_windows = [make_windows(normalizer.transform_X(Xs), Ys, L)
+                   for Xs, Ys in source_domains]
+    X_src_n = np.concatenate([Xw for Xw, _ in src_windows], axis=0)
+    Y_src_n = normalizer.transform_Y(np.concatenate([Yw for _, Yw in src_windows]))
 
-    target_X_n = normalizer.transform_X(target_X)
-    target_Y_n = normalizer.transform_Y(target_Y)
+    target_X_n, target_Y_n = make_windows(normalizer.transform_X(target_X),
+                                          normalizer.transform_Y(target_Y), L)
 
-    # split in train/eval
+    # split in train/eval (gap only used by block mode)
     (trg_train_X, trg_train_Y), (trg_val_X, trg_val_Y) = split_domain(
-        target_X_n, target_Y_n, val_ratio=0.2, seed=args.seed)
+        target_X_n, target_Y_n, val_ratio=0.2, seed=args.seed,
+        mode=args.val_split, gap=L - 1)
 
     # Dataloader trg_train_Y not used
-    if args.ms_mode == "combine":
-        # single pooled source domain -- the setting the MCD paper describes
-        src_loaders = [make_loader(X_src_n, Y_src_n, args.batch_size)]
-    else:
-        # one loader per animal; the per-animal batch size keeps the total
-        # number of source samples per step at roughly args.batch_size
-        per = max(args.batch_size // len(source_domains), 2)
-        src_loaders = [make_loader(normalizer.transform_X(Xs),
-                                   normalizer.transform_Y(Ys), per)
-                       for Xs, Ys in source_domains]
+    src_loader = make_loader(X_src_n, Y_src_n, args.batch_size)
     trg_loader = make_loader(trg_train_X, trg_train_Y, args.batch_size)
     val_loader = make_loader(trg_val_X, trg_val_Y, args.batch_size,
                              shuffle=False, drop_last=False)
@@ -657,25 +537,19 @@ def train(args):
         hidden_dim=args.hidden_dim,
         K= args.K,
         drt_activated=args.DRT_activated,
-        basis_scale = args.basis_scale
+        basis_scale = args.basis_scale,
+        kernel_size=args.kernel_size,
+        phi_kernel=args.phi_kernel,
     ).to(device)
+    if L < G.receptive_field:
+        raise ValueError(f"--window {L} is shorter than the receptive field "
+                         f"({G.receptive_field} beats for kernel_size={args.kernel_size})")
 
-    # pairs: one head group per source animal -- M3SDA's N classifiers. With
-    # n_heads=2 each group is a pair, which is what MCD's discrepancy needs
-    # (M3SDA-beta); with n_heads=1 it is plain M3SDA.
-    if args.MCD_activated and args.n_heads < 2:
-        raise ValueError("MCD needs --n_heads 2 (the discrepancy is between "
-                         "the two heads of a group)")
-    if args.md_weight > 0 and args.ms_mode == "combine":
-        print("  [warn] --md_weight > 0 with --ms_mode combine: the sources "
-              "are pooled, so the source-source term is empty")
-    n_groups = len(source_domains) if args.ms_mode == "pairs" else 1
-    heads = [tuple(RegressorHead(hidden_dim=args.hidden_dim).to(device)
-                   for _ in range(args.n_heads))
-             for _ in range(n_groups)]
+    F1 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
+    F2 = RegressorHead(hidden_dim=args.hidden_dim).to(device)
 
     opt_g = optim.SGD(G.parameters(), lr=args.lr, momentum=0.9)
-    opt_f = optim.SGD([p for h in flat_heads(heads) for p in h.parameters()],
+    opt_f = optim.SGD(list(F1.parameters()) + list(F2.parameters()),
                       lr=args.lr_f, momentum=0.9)
 
     sch_g = optim.lr_scheduler.MultiStepLR(opt_g, milestones=args.schedule,
@@ -692,14 +566,14 @@ def train(args):
         mlflow.log_param("n_params_G", sum(p.numel() for p in G.parameters()))
 
         #Phase 1
-        metrics = run_phase(G, heads, opt_g, opt_f, sch_g, sch_f,
-                            src_loaders, trg_loader, val_loader, normalizer,
+        metrics = run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f,
+                            src_loader, trg_loader, val_loader, normalizer,
                             device, args, args.epochs, 0, phase=0)
 
         #Phase 2: self-training
         if args.ST_activated:
             Xp, Yp, keep_rate, thr = make_pseudo_labels(
-                G, heads, trg_train_X, device, args.st_keep_quantile)
+                G, F1, F2, trg_train_X, device, args.st_keep_quantile)
 
             # mlflow.log_metrics({"st_keep_rate": keep_rate,
             #                     "st_threshold": thr,
@@ -720,8 +594,8 @@ def train(args):
                 sch_g = optim.lr_scheduler.MultiStepLR(opt_g, [], gamma=0.1)
                 sch_f = optim.lr_scheduler.MultiStepLR(opt_f, [], gamma=0.1)
 
-                metrics = run_phase(G, heads, opt_g, opt_f, sch_g, sch_f,
-                                    src_loaders, trg_loader, val_loader,
+                metrics = run_phase(G, F1, F2, opt_g, opt_f, sch_g, sch_f,
+                                    src_loader, trg_loader, val_loader,
                                     normalizer, device, args, args.st_epochs,
                                     args.epochs, phase=1,
                                     pseudo_loader=pseudo_loader)
@@ -730,22 +604,18 @@ def train(args):
                       f"need > {args.batch_size}")
 
 
-        # --------------------------
-        # optional post-hoc analysis
-        # --------------------------
-        # one seed SHAP Values
-
-
-        F1 = MeanHead([h[0] for h in heads]).to(device)
-        F2 = MeanHead([h[-1] for h in heads]).to(device)   # == F1 if n_heads=1
-
+        # ---- post-hoc SHAP (one seed only; ~410k forward rows per beat) ----
         if args.shap and args.seed == args.shap_seed:
-            names = (args.feature_names.split(",") if args.feature_names
+            base = (args.feature_names.split(",") if args.feature_names
                      else [f"f{i}" for i in range(args.input_dim)])
+            # KernelSHAP needs flat rows, so every (feature, lag) pair becomes
+            # one input: 14*L features instead of 14. Sum over lags afterwards
+            # for per-feature importance. Order matches reshape(N, C*L).
+            names = [f"{n}@t-{L - 1 - j}" for n in base for j in range(L)]
             run_shap_for_fold(
-                G, F1, F2,
-                X_background=trg_train_X,   # variation within this animal
-                X_explain=trg_val_X,        # the same split evaluate() scores
+                FlatWindow(G, args.input_dim, L), F1, F2,
+                X_background=trg_train_X.reshape(len(trg_train_X), -1),  # variation within this animal
+                X_explain=trg_val_X.reshape(len(trg_val_X), -1),         # the same split evaluate() scores
                 feature_names=names,
                 out_dir=args.shap_dir,
                 fold=args.target_x_dict.replace("X_", "").replace(".csv", ""),
@@ -758,7 +628,7 @@ def train(args):
                 y_std=float(normalizer.Y_std),
             )
 
-        # residual plots
+        # ---- actual vs predicted + residuals over time (one seed only) ----
         if args.seed == args.shap_seed:
             fold = args.target_x_dict.replace("X_", "").replace(".csv", "")
             cfg = (f"mcd{int(args.MCD_activated)}drt{int(args.DRT_activated)}"
@@ -766,22 +636,21 @@ def train(args):
             os.makedirs("pred_plots", exist_ok=True)
             plot_fold(
                 G, F1, F2,
-                X=target_X_n,            # full animal, unshuffled -> row order = time
-                y=target_Y_n,            # normalized; plot_fold de-normalizes
+                X=target_X_n,            # full animal as windows, unshuffled -> row order = time
+                y=target_Y_n,            # (row i is beat i + L-1); normalized, plot_fold de-normalizes
                 animal_id=fold,
                 y_mean=float(normalizer.Y_mean),
                 y_std=float(normalizer.Y_std),
                 device=device,
-                out_path=f"pred_plots/{cfg}_{fold}_seed{args.seed}.png",
+                out_path=f"pred_plots_conv/{cfg}_{fold}_seed{args.seed}.png",
             )
 
-        #PIs for t-sne
+        #dump Pi
         if args.pi_dump_dir and args.DRT_activated:
             names = [args.target_x_dict] + args.source_x_dicts.split(",")
             names = [n.replace("X_", "").replace(".csv", "") for n in names]
             domains = [(trg_val_X, normalizer.inverse_Y(trg_val_Y))]
-            domains += [(normalizer.transform_X(Xs), Ys)
-                        for Xs, Ys in source_domains]
+            domains += src_windows      # (normalized X windows, raw Y) per source animal
 
             res = dump_pi(
                 G, lambda X, Y: make_loader(X, Y, 512, shuffle=False,
@@ -809,8 +678,8 @@ def parse_args():
     p.add_argument("--source_x_dicts", type=str, default="X_anim3.csv,X_anim4.csv,X_anim8.csv,X_anim10.csv")
     p.add_argument("--source_y_dicts", type=str, default="Y_anim3.csv,Y_anim4.csv,Y_anim8.csv,Y_anim10.csv")
 
-    p.add_argument("--epochs", type=int, default=150) #150
-    p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training") #100
+    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--warmup_epochs", type=int, default=100, help="source-only training")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.001, help="backbone lr")
     p.add_argument("--lr_f", type=float, default=0.005, help="head lr")
@@ -826,33 +695,20 @@ def parse_args():
     p.add_argument("--pi_dump_dir", type=str, default="pi_dumps")
     p.add_argument("--pi_max_per_domain", type=int, default=2000)
 
+    # temporal convolution
+    p.add_argument("--window", type=int, default=7,
+                   help="beats per window; >= receptive field 1+2*(kernel_size-1)")
+    p.add_argument("--kernel_size", type=int, default=3, help="temporal width of W_0")
+    p.add_argument("--phi_kernel", type=int, default=2,
+                   help="temporal width of the bases Phi_i (released code: 1)")
+    p.add_argument("--val_split", type=str, default="random", choices=["random", "block"],
+                   help="target train/val split of the windows")
+
     #MCD
     p.add_argument("--eta", type=float, default=0.1, help="discrepancy weight")
     p.add_argument("--gamma", type=float, default=0.001, help="variance penalty weight")
-    p.add_argument("--ms_mode", type=str, default="balanced",
-                   choices=["combine", "balanced", "pairs"],
-                   help="combine: pooled source ;"
-                        "balanced: one batch per animal, one head pair;"
-                        "pairs: one head pair per animal")
     p.add_argument("--num_k", type=int, default=1,
                    help="generator updates per batch in Step C (MCD's num_k)")
-
-    # M3SDA
-    p.add_argument("--md_weight", type=float, default=0.5,
-                   help="lambda on the moment distance MD^2 (paper: 0.5, "
-                        "stable in 0.1-1); 0 disables moment matching")
-    p.add_argument("--md_orders", type=int, default=2,
-                   help="highest moment matched (paper: 2)")
-    p.add_argument("--md_source_source", type=int, default=1,
-                   help="1: match sources with each other too (full MD^2); "
-                        "0: source-target only, the paper's S-T ablation")
-    p.add_argument("--n_heads", type=int, default=2, choices=[1, 2],
-                   help="heads per source domain; 2 is required for MCD "
-                        "(M3SDA-beta), 1 is plain M3SDA")
-    p.add_argument("--head_weighting", type=str, default="uniform",
-                   choices=["uniform", "moment", "discrepancy"],
-                   help="uniform: M3SDA*; moment/discrepancy: unsupervised "
-                        "stand-ins for the paper's accuracy-based weights")
 
     # self-training
     p.add_argument("--st_epochs", type=int, default=30)
@@ -867,7 +723,7 @@ def parse_args():
 
     # SHAP
     p.add_argument("--shap", type=bool, default=False, help="post-hoc KernelSHAP after training")
-    p.add_argument("--shap_dir", type=str, default="shap_dumps")
+    p.add_argument("--shap_dir", type=str, default="shap_dumps_conv")
     p.add_argument("--shap_n", type=int, default=100, help="target beats to explain")
     p.add_argument("--shap_background", type=int, default=25, help="k-means centroids")
     p.add_argument("--shap_seed", type=int, default=100, help="only this seed gets SHAP")
@@ -894,11 +750,11 @@ def main():
 
     # MCD DRT ST
     allowed_values = [
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
+        # (False, False, False),
+        # (False, True, False),
+        # (True, False, False),
         (True, True, False),
-        (True, True, True)
+        # (True, True, True)
     ]
 
     keys = ["MCD_activated", "DRT_activated", "ST_activated"]
@@ -975,7 +831,7 @@ def main():
                                 "mean_raw_R2": float(np.mean(all_target_r2_raw_means)),
                                 "mean_Corr": float(np.mean(all_target_corr_means))})
 
-        output_file = "drt_training_results.txt"
+        output_file = "../drt_training_results.txt"
 
         with open(output_file, "a", encoding="utf-8") as f:
 

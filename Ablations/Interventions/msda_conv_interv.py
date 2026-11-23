@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Multi-source unsupervised domain adaptation for stroke-work regression.
 
@@ -25,6 +24,10 @@ SOURCE animals as privileged information during training (never for the target).
   Both losses are added to Step A on the labelled source beats only. On the target, the
   routing is predicted from the input. The target's conditions are used only to report how
   well its routing / auxiliary head recognise them (test_route_acc, test_aux_acc).
+  Diagnostics per run: src_route_acc / src_aux_acc on the labelled source beats (training
+  data: can the conditions be learnt at all?), <split>_majority = accuracy of always
+  predicting the most frequent class, <split>_route_top = share of the most frequent
+  predicted routing class (close to 1 = practically constant routing).
   Without DRT (source_only, mcd, oracle) there is no routing to supervise; the auxiliary
   head still works if switched on.
   Data: one file per animal, --interv_pattern (default I_<animal>.csv), with a header and
@@ -102,13 +105,12 @@ DEFAULT_SEEDS = [100, 200, 74, 15, 984]
 
 CONFIGS = {
     "source_only": dict(mcd=False, drt=False, st=False, oracle=False),
-    "drt":         dict(mcd=False, drt=True,  st=False, oracle=False),
-    "mcd":         dict(mcd=True,  drt=False, st=False, oracle=False),
-    "mcd_drt":     dict(mcd=True,  drt=True,  st=False, oracle=False),
-    "mcd_drt_st":  dict(mcd=True,  drt=True,  st=True,  oracle=False),
-    "oracle":      dict(mcd=False, drt=False, st=False, oracle=True),
+    "drt": dict(mcd=False, drt=True, st=False, oracle=False),
+    "mcd": dict(mcd=True, drt=False, st=False, oracle=False),
+    "mcd_drt": dict(mcd=True, drt=True, st=False, oracle=False),
+    "mcd_drt_st": dict(mcd=True, drt=True, st=True, oracle=False),
+    "oracle": dict(mcd=False, drt=False, st=False, oracle=True),
 }
-
 
 # =============================================================================
 # Data
@@ -141,7 +143,7 @@ def make_windows(X, rows, L):
     Conv1d expects. The first L-1 beats are padded with the first beat. Called on one
     animal at a time, so no window spans two animals."""
     Xp = np.concatenate([np.repeat(X[:1], L - 1, axis=0), X], axis=0)
-    W = np.lib.stride_tricks.sliding_window_view(Xp, L, axis=0)   # [T, C, L], W[t] ends at t
+    W = np.lib.stride_tricks.sliding_window_view(Xp, L, axis=0)  # [T, C, L], W[t] ends at t
     return np.ascontiguousarray(W[rows], dtype=np.float32)
 
 
@@ -149,9 +151,11 @@ def routing_context(X, N, stats):
     """Causal summary of the last N beats for every beat: [T, C] (mean) or [T, 2C]
     (mean and SD). The first N-1 beats are padded with the first beat."""
     Xp = np.concatenate([np.repeat(X[:1], N - 1, axis=0), X], axis=0).astype(np.float64)
+
     def rolling_mean(a):
         cs = np.concatenate([np.zeros((1, a.shape[1])), np.cumsum(a, axis=0)], axis=0)
-        return (cs[N:] - cs[:-N]) / N                  # row t: beats t-N+1 .. t
+        return (cs[N:] - cs[:-N]) / N  # row t: beats t-N+1 .. t
+
     mean = rolling_mean(Xp)
     if stats == "mean":
         return mean.astype(np.float32)
@@ -248,19 +252,19 @@ class Stats:
 class Fold:
     target: str
     source_ids: list
-    src_X: list            # standardised windows [N, C, L] per source domain
-    src_y: list            # standardised stroke work per source domain
-    adapt_X: np.ndarray    # windows, unlabelled for training
-    adapt_y: np.ndarray    # raw stroke work, evaluation only
+    src_X: list  # standardised windows [N, C, L] per source domain
+    src_y: list  # standardised stroke work per source domain
+    adapt_X: np.ndarray  # windows, unlabelled for training
+    adapt_y: np.ndarray  # raw stroke work, evaluation only
     test_X: np.ndarray
-    test_y: np.ndarray     # raw stroke work, evaluation only
+    test_y: np.ndarray  # raw stroke work, evaluation only
     y_stats: Stats
     adapt_idx: np.ndarray  # row indices in the full recording of the target
     test_idx: np.ndarray
-    n_adapt_dropped: int   # adaptation windows removed because they contain a test beat
-    n_feat: int            # input features; further channels hold the routing context
-    src_c: list            # loading condition per source beat (-1 = ignored)
-    adapt_c: np.ndarray    # conditions of the target, evaluation only (-1 if unknown)
+    n_adapt_dropped: int  # adaptation windows removed because they contain a test beat
+    n_feat: int  # input features; further channels hold the routing context
+    src_c: list  # loading condition per source beat (-1 = ignored)
+    adapt_c: np.ndarray  # conditions of the target, evaluation only (-1 if unknown)
     test_c: np.ndarray
     n_classes: int
 
@@ -307,7 +311,7 @@ def build_fold(args, target: str, sources: list, oracle: bool) -> Fold:
         return c
 
     ct = conditions(target, len(yt))
-    if oracle:   # upper reference: labelled data of the target animal itself
+    if oracle:  # upper reference: labelled data of the target animal itself
         src = [(target, Xt, yt, adapt_rows)]
         src_cond = [ct]
     else:
@@ -323,9 +327,9 @@ def build_fold(args, target: str, sources: list, oracle: bool) -> Fold:
         x_stats = Stats.fit(np.concatenate([X[r] for _, X, _, r in src]))
         src_stats = [x_stats] * len(src)
         tgt_stats = x_stats
-    else:        # per_animal
+    else:  # per_animal
         src_stats = [Stats.fit(X[r]) for _, X, _, r in src]
-        tgt_stats = Stats.fit(Xt[adapt_rows])      # unlabelled adaptation split only
+        tgt_stats = Stats.fit(Xt[adapt_rows])  # unlabelled adaptation split only
 
     src_X = [make_inputs(s.apply(X), r, args) for s, (_, X, _, r) in zip(src_stats, src)]
     src_y = [y_stats.apply(y[r]) for _, _, y, r in src]
@@ -419,19 +423,19 @@ class DRTConv1d(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.branch, self.to_lambda, self.to_pi = make_branch(route_dim)
 
-    def forward(self, x, ctx=None):                               # [B, C_in, L]
-        z0 = F.conv1d(x, self.weight)                             # [B, C_out, L-k+1]
+    def forward(self, x, ctx=None):  # [B, C_in, L]
+        z0 = F.conv1d(x, self.weight)  # [B, C_out, L-k+1]
         b = self.bias.unsqueeze(-1)
         if not self.drt:
             return z0 + b
-        h = self.branch(x.mean(-1) if ctx is None else ctx)       # window mean or context
-        lam = torch.sigmoid(self.to_lambda(h))                    # [B, C_out]
-        logits = self.to_pi(h)                                    # [B, K]
-        self.last_logits = logits          # kept with gradient for the routing supervision
+        h = self.branch(x.mean(-1) if ctx is None else ctx)  # window mean or context
+        lam = torch.sigmoid(self.to_lambda(h))  # [B, C_out]
+        logits = self.to_pi(h)  # [B, K]
+        self.last_logits = logits  # kept with gradient for the routing supervision
         pi = torch.softmax(logits, dim=-1)
         z = F.conv1d(x, self.basis.reshape(self.K * self.out_dim, -1, self.k_phi))
-        z = z[..., self.k - self.k_phi:]                          # align last beats
-        z = z.reshape(z.size(0), self.K, self.out_dim, -1)        # Phi_k * x
+        z = z[..., self.k - self.k_phi:]  # align last beats
+        z = z.reshape(z.size(0), self.K, self.out_dim, -1)  # Phi_k * x
         return z0 + lam.unsqueeze(-1) * z0 + (pi[:, :, None, None] * z).sum(1) + b
 
 
@@ -448,7 +452,7 @@ class ConvBackbone(nn.Module):
         super().__init__()
         self.n_feat, self.ctx_dim = in_dim, ctx_dim
         layers, c_in = [], in_dim
-        for c in channels:   # same creation order as msda_conv.py (identical initialisation)
+        for c in channels:  # same creation order as msda_conv.py (identical initialisation)
             layers += [DRTConv1d(c_in, c, kernel_size, phi_kernel, K, drt, basis_scale,
                                  route_dim=ctx_dim),
                        nn.BatchNorm1d(c), nn.ReLU()]
@@ -508,7 +512,7 @@ class MSDAModel(nn.Module):
     def pair(self, k):
         return self.heads[2 * k], self.heads[2 * k + 1]
 
-    def all_heads(self, feat):                       # [2 * n_pairs, B]
+    def all_heads(self, feat):  # [2 * n_pairs, B]
         return torch.stack([h(feat) for h in self.heads])
 
     @torch.no_grad()
@@ -563,14 +567,14 @@ def target_pass(module, args):
 def with_target_bn_stats(model, X, batch_size=512):
     """Copy of the model whose BatchNorm statistics are recomputed on the target data X
     (AdaBN). All other parameters are unchanged."""
-    for layer in model.modules():           # stored routing logits cannot be deep-copied
+    for layer in model.modules():  # stored routing logits cannot be deep-copied
         if isinstance(layer, DRTConv1d):
             layer.last_logits = None
     m = copy.deepcopy(model)
     bns = [b for b in m.G.modules() if isinstance(b, nn.modules.batchnorm._BatchNorm)]
     for b in bns:
         b.reset_running_stats()
-        b.momentum = None              # cumulative average over all batches
+        b.momentum = None  # cumulative average over all batches
     m.eval()
     for b in bns:
         b.train()
@@ -663,7 +667,7 @@ def da_weight(epoch, args):
 def make_pseudo_labels(model, X, keep_quantile):
     """Pseudo-label = mean of all heads; confidence = agreement of the heads of each pair.
     Keeps the target windows whose discrepancy is at most the given quantile."""
-    P = model.all_heads_eval(X)                          # [2 * n_pairs, N]
+    P = model.all_heads_eval(X)  # [2 * n_pairs, N]
     pseudo = P.mean(0)
     d = (P[0::2] - P[1::2]).abs().mean(0)
     thr = torch.quantile(d, keep_quantile)
@@ -704,16 +708,18 @@ def run_epochs(model, opt_g, opt_f, opt_x, scheds, streams, trg_stream, pseudo_s
                     l_ps = pseudo_loss(model, model.G(xp), yp)
                 loss_a = loss_a + args.st_weight * l_ps
                 log["pseudo_mse"] += l_ps.item()
-            opt_g.zero_grad(); opt_f.zero_grad()
+            opt_g.zero_grad();
+            opt_f.zero_grad()
             if opt_x is not None:
                 opt_x.zero_grad()
             loss_a.backward()
-            opt_g.step(); opt_f.step()
+            opt_g.step();
+            opt_f.step()
             if opt_x is not None:
                 opt_x.step()
             log["src_mse"] += l_src.item()
 
-            if w == 0.0:          # warm-up: identical to source-only training
+            if w == 0.0:  # warm-up: identical to source-only training
                 continue
             (xt,) = trg_stream.next()
 
@@ -759,7 +765,7 @@ def run_epochs(model, opt_g, opt_f, opt_x, scheds, streams, trg_stream, pseudo_s
                 msg += f"  route_ce={log['route_ce'] / steps:.3f}"
             if "aux_ce" in log:
                 msg += f"  aux_ce={log['aux_ce'] / steps:.3f}"
-            if args.monitor_target:    # debugging only: uses target labels
+            if args.monitor_target:  # debugging only: uses target labels
                 msg += (f"  [label-based] test_rmse="
                         f"{evaluate(eval_model(model, fold, args, device), fold, 'test', device)['rmse']:.1f}")
             print(msg, flush=True)
@@ -789,13 +795,21 @@ def evaluate(model, fold, split, device):
 
 @torch.no_grad()
 def condition_accuracy(model, X, c, batch_size=2048):
-    """Share of target beats whose condition is recognised by the routing of the last DRT
-    layer and by the auxiliary head (evaluation only; target conditions are never used for
-    training)."""
+    """How well the routing of the last DRT layer and the auxiliary head recognise the
+    loading condition of the beats X (evaluation only; target conditions are never used
+    for training).
+      route_acc / aux_acc   share of beats whose condition is predicted correctly
+      route_top             share of the most frequent predicted routing class
+                            (close to 1: the routing predicts practically one class)
+      majority              share of the most frequent true class, i.e. the accuracy of
+                            always predicting that class"""
     keep = c >= 0
-    out = {"route_acc": float("nan"), "aux_acc": float("nan")}
+    out = {"route_acc": float("nan"), "aux_acc": float("nan"),
+           "route_top": float("nan"), "majority": float("nan")}
     if not keep.any():
         return out
+    ct = torch.as_tensor(c)
+    out["majority"] = float(torch.bincount(ct[keep]).max()) / int(keep.sum())
     model.eval()
     route, aux = [], []
     for i in range(0, len(X), batch_size):
@@ -805,9 +819,10 @@ def condition_accuracy(model, X, c, batch_size=2048):
             route.append(z[-1].argmax(1).cpu())
         if model.aux_head is not None:
             aux.append(model.aux_head(feat).argmax(1).cpu())
-    ct = torch.as_tensor(c)
     if route:
-        out["route_acc"] = float((torch.cat(route)[keep] == ct[keep]).float().mean())
+        pr = torch.cat(route)[keep]
+        out["route_acc"] = float((pr == ct[keep]).float().mean())
+        out["route_top"] = float(torch.bincount(pr).max()) / len(pr)
     if aux:
         out["aux_acc"] = float((torch.cat(aux)[keep] == ct[keep]).float().mean())
     return out
@@ -848,7 +863,7 @@ def train_run(args, cfg_name, fold, seed, device):
     if args.source_mode == "pooled" or cfg["oracle"]:
         streams = [BatchStream((tens(np.concatenate(fold.src_X)), tens(np.concatenate(fold.src_y)),
                                 tens(np.concatenate(fold.src_c))), args.batch_size, gen)]
-    else:   # balanced / per_domain: equal share of each source animal in every batch
+    else:  # balanced / per_domain: equal share of each source animal in every batch
         bs = max(2, args.batch_size // len(fold.src_X))
         streams = [BatchStream((tens(X), tens(y), tens(c)), bs, gen)
                    for X, y, c in zip(fold.src_X, fold.src_y, fold.src_c)]
@@ -881,13 +896,19 @@ def train_run(args, cfg_name, fold, seed, device):
     final = eval_model(model, fold, args, device)
     for split in ("test", "adapt"):
         if cfg["oracle"] and split == "adapt":
-            continue   # adaptation split is the oracle's training data
+            continue  # adaptation split is the oracle's training data
         for k, v in evaluate(final, fold, split, device).items():
             result[f"{split}_{k}"] = v
         X = torch.as_tensor(fold.test_X if split == "test" else fold.adapt_X, device=device)
         c = fold.test_c if split == "test" else fold.adapt_c
         for k, v in condition_accuracy(final, X, c).items():
             result[f"{split}_{k}"] = v
+    # the same on the labelled source beats (training data): shows whether the conditions
+    # can be learnt at all; compared with the target it shows whether they transfer
+    if not cfg["oracle"]:
+        Xs = torch.as_tensor(np.concatenate(fold.src_X), device=device)
+        for k, v in condition_accuracy(final, Xs, np.concatenate(fold.src_c)).items():
+            result[f"src_{k}"] = v
 
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
@@ -900,7 +921,8 @@ def train_run(args, cfg_name, fold, seed, device):
                     "channels": args.channels, "ctx_len": args.ctx_len,
                     "ctx_stats": args.ctx_stats, "n_feat": fold.n_feat,
                     "route_sup": args.route_sup, "route_weight": args.route_weight,
-                    "aux_weight": args.aux_weight, "class_names": class_names(args)},
+                    "aux_weight": args.aux_weight, "class_names": class_names(args),
+                    "K": K, "n_classes": fold.n_classes},
                    os.path.join(args.save_dir,
                                 f"{ARCH}_{args.route_sup}{args.route_weight}_aux{args.aux_weight}_"
                                 f"N{args.ctx_len}_L{args.window}_k{args.kernel_size}_"
@@ -921,7 +943,21 @@ FIELDS = ["run_id", "arch", "protocol", "config", "source_mode", "norm", "target
           "drop_features", "target",
           "sources", "seed", "test_rmse", "test_mae", "test_r2", "test_r",
           "adapt_rmse", "adapt_mae", "adapt_r2", "adapt_r", "st_keep_rate",
-          "test_route_acc", "adapt_route_acc", "test_aux_acc", "adapt_aux_acc"]
+          "test_route_acc", "adapt_route_acc", "test_aux_acc", "adapt_aux_acc",
+          "src_route_acc", "src_aux_acc", "test_majority", "adapt_majority", "src_majority",
+          "test_route_top", "adapt_route_top", "src_route_top"]
+
+
+def check_out_file(path):
+    """Rows are appended to --out. A file written by an older version has other columns,
+    so new rows would be shifted against its header."""
+    if not os.path.exists(path):
+        return
+    with open(path, newline="") as f:
+        header = next(csv.reader(f), [])
+    if header and header != FIELDS:
+        raise SystemExit(f"{path} has other columns than this version writes "
+                         f"(older version?); choose a new --out file")
 
 
 def append_row(path, row):
@@ -940,13 +976,20 @@ def summarize(path, run_id):
     if df.empty:
         return
     per_target = (df.groupby(["config", "target"])[["test_rmse", "test_r2"]]
-                    .agg(["mean", "std"]).round(3))
+                  .agg(["mean", "std"]).round(3))
     print("\nPer target (mean and std over seeds, held-out test split):")
     print(per_target.to_string())
     seed_mean = df.groupby(["config", "target"])[["test_rmse", "test_r2"]].mean()
     overall = seed_mean.groupby("config").agg(["mean", "std"]).round(3)
     print("\nAcross targets (mean and std of the per-target means):")
     print(overall.to_string())
+    cols = ["src_route_acc", "test_route_acc", "test_majority", "test_route_top"]
+    acc = df[df["test_route_acc"].notna()]
+    if not acc.empty:
+        print("\nCondition recognition by the routing (mean over seeds): source (training "
+              "data) vs target test split; majority = always the most frequent class, "
+              "route_top = share of the most frequent predicted class")
+        print(acc.groupby(["config", "target"])[cols].mean().round(3).to_string())
 
 
 def parse_args():
@@ -1078,6 +1121,7 @@ def main():
         print("WARNING: --monitor_target prints label-based target metrics. "
               "Do not use them to make any decision.")
 
+    check_out_file(args.out)
     run_id = time.strftime("%Y%m%d-%H%M%S")
     print(f"run {run_id}: {ARCH}, channels={args.channels}, kernel_size={args.kernel_size}, "
           f"phi_kernel={args.phi_kernel}, window={args.window}, ctx_len={args.ctx_len} "
